@@ -121,7 +121,7 @@ class LongbridgeDataClientConfig(_SafeConfigMixin, DataClientConfig):
         *,
         region: str | None = None,
         paper_trading: bool | None = None,
-        dry_run: bool = True,
+        dry_run: bool | None = None,
         http_url: str | None = None,
         quote_ws_url: str | None = None,
         trade_ws_url: str | None = None,
@@ -140,7 +140,7 @@ class LongbridgeDataClientConfig(_SafeConfigMixin, DataClientConfig):
             paper_trading=_env_bool("LONGBRIDGE_PAPERTRADING", True)
             if paper_trading is None
             else paper_trading,
-            dry_run=dry_run,
+            dry_run=_env_bool("LONGBRIDGE_DRY_RUN", True) if dry_run is None else dry_run,
             http_url=_explicit_or_env("LONGBRIDGE_HTTP_URL", http_url),
             quote_ws_url=_explicit_or_env("LONGBRIDGE_QUOTE_WS_URL", quote_ws_url),
             trade_ws_url=_explicit_or_env("LONGBRIDGE_TRADE_WS_URL", trade_ws_url),
@@ -189,7 +189,7 @@ class LongbridgeExecutionClientConfig(_SafeConfigMixin, ExecutionClientConfig):
         base_currency: str = "USD",
         region: str | None = None,
         paper_trading: bool | None = None,
-        dry_run: bool = True,
+        dry_run: bool | None = None,
         http_url: str | None = None,
         quote_ws_url: str | None = None,
         trade_ws_url: str | None = None,
@@ -200,7 +200,8 @@ class LongbridgeExecutionClientConfig(_SafeConfigMixin, ExecutionClientConfig):
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        account_id = account_id or _env_text("LONGBRIDGE_ACCOUNT_ID")
+        if account_id is None:
+            account_id = _env_text("LONGBRIDGE_ACCOUNT_ID")
         if account_id is None:
             raise ConfigurationError("account_id is required or set LONGBRIDGE_ACCOUNT_ID")
         if not account_id.strip():
@@ -213,7 +214,7 @@ class LongbridgeExecutionClientConfig(_SafeConfigMixin, ExecutionClientConfig):
             paper_trading=_env_bool("LONGBRIDGE_PAPERTRADING", True)
             if paper_trading is None
             else paper_trading,
-            dry_run=dry_run,
+            dry_run=_env_bool("LONGBRIDGE_DRY_RUN", True) if dry_run is None else dry_run,
             http_url=_explicit_or_env("LONGBRIDGE_HTTP_URL", http_url),
             quote_ws_url=_explicit_or_env("LONGBRIDGE_QUOTE_WS_URL", quote_ws_url),
             trade_ws_url=_explicit_or_env("LONGBRIDGE_TRADE_WS_URL", trade_ws_url),
@@ -267,11 +268,22 @@ def build_sdk_config(settings: LongbridgeSafeSettings) -> Any:
     # validated routing label, while explicit endpoint overrides are honored.
     # Keeping the defaults here makes endpoint selection deterministic and
     # prevents a stale process environment from silently changing the client.
-    endpoint_defaults = {
-        "http_url": "https://openapi.longbridge.com",
-        "quote_ws_url": "wss://openapi-quote.longbridge.com/v2",
-        "trade_ws_url": "wss://openapi-trade.longbridge.com/v2",
+    endpoint_defaults_by_region = {
+        "hk": {
+            "http_url": "https://openapi.longbridge.com",
+            "quote_ws_url": "wss://openapi-quote.longbridge.com/v2",
+            "trade_ws_url": "wss://openapi-trade.longbridge.com/v2",
+        },
+        # SDK 5.2.2 documents the same global endpoint set for the supported
+        # account regions; keep the region choice explicit for future endpoint
+        # changes and for tests that validate routing configuration.
+        "cn": {
+            "http_url": "https://openapi.longbridge.com",
+            "quote_ws_url": "wss://openapi-quote.longbridge.com/v2",
+            "trade_ws_url": "wss://openapi-trade.longbridge.com/v2",
+        },
     }
+    endpoint_defaults = endpoint_defaults_by_region[settings.region]
     return Config.from_apikey(
         os.environ[names[0]],
         os.environ[names[1]],

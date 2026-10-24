@@ -62,7 +62,9 @@ def test_non_secret_settings_load_from_environment(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("LONGBRIDGE_ACCOUNT_ID", "ACCOUNT-FROM-ENV")
     monkeypatch.setenv("LONGBRIDGE_REGION", "cn")
     monkeypatch.setenv("LONGBRIDGE_REQUEST_TIMEOUT_SECS", "7.5")
+    monkeypatch.setenv("LONGBRIDGE_DRY_RUN", "false")
     config = LongbridgeExecutionClientConfig()
     assert config.account_id == "ACCOUNT-FROM-ENV"
     assert config.settings.region == "cn"
     assert config.settings.request_timeout_secs == 7.5
+    assert config.settings.dry_run is False
