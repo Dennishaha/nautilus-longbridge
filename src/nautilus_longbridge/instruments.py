@@ -10,6 +10,9 @@ from .config import market_for_symbol
 from .errors import ConfigurationError, UnsupportedOperation
 from .symbols import instrument_id_from_symbol, symbol_from_instrument_id
 
+SUPPORTED_SECURITY_TYPES = frozenset({"STOCK", "EQUITY", "COMMON_STOCK", "ETF", "ETP"})
+UNSUPPORTED_SECURITY_MARKERS = frozenset({"OPTION", "WARRANT", "CBBC", "DERIVATIVE"})
+
 
 def validate_lot_size(order_quantity: Decimal, lot_size: Decimal, symbol: str) -> None:
     """Validate an equity order quantity against the venue board lot."""
@@ -64,12 +67,21 @@ class LongbridgeInstrumentProvider(InstrumentProvider):
     def _to_equity(self, info: Any) -> Equity:
         raw_symbol = str(info.symbol).upper()
         market_for_symbol(raw_symbol)
-        security_type = str(
-            getattr(info, "security_type", getattr(info, "asset_type", ""))
-        ).upper()
-        if any(kind in security_type for kind in ("OPTION", "WARRANT", "CBBC", "DERIVATIVE")):
+        explicit_type = self._explicit_security_type(info)
+        board_type = self._board_type(info)
+        security_type = explicit_type or board_type
+        if security_type in UNSUPPORTED_SECURITY_MARKERS:
             raise UnsupportedOperation(
-                f"Longbridge phase 1 does not support derivative instrument {raw_symbol}"
+                f"Longbridge phase 1 does not support {security_type.lower()} instrument {raw_symbol}"
+            )
+        if explicit_type is not None and explicit_type not in SUPPORTED_SECURITY_TYPES:
+            raise UnsupportedOperation(
+                f"Longbridge phase 1 supports {sorted(SUPPORTED_SECURITY_TYPES)}, "
+                f"got security type {explicit_type!r} for {raw_symbol}"
+            )
+        if board_type is not None and board_type in UNSUPPORTED_SECURITY_MARKERS:
+            raise UnsupportedOperation(
+                f"Longbridge phase 1 does not support {board_type.lower()} instrument {raw_symbol}"
             )
         instrument_id = instrument_id_from_symbol(raw_symbol)
         currency = Currency.from_str(str(info.currency).upper())
@@ -93,3 +105,27 @@ class LongbridgeInstrumentProvider(InstrumentProvider):
         )
         self.add_currency(currency)
         return instrument
+
+    @staticmethod
+    def _explicit_security_type(info: Any) -> str | None:
+        for field in ("security_type", "asset_type"):
+            if not hasattr(info, field):
+                continue
+            value = getattr(info, field)
+            if value is None or not str(value).strip():
+                continue
+            return str(value).upper().replace("-", "_").replace(" ", "_")
+        return None
+
+    @staticmethod
+    def _board_type(info: Any) -> str | None:
+        value = getattr(info, "board", None)
+        if value is None:
+            return None
+        name = getattr(value, "__name__", None) or getattr(value, "name", None) or str(value)
+        normalized = str(name).upper().replace("SECURITYBOARD.", "")
+        if "WARRANT" in normalized:
+            return "WARRANT"
+        if "OPTION" in normalized:
+            return "OPTION"
+        return None

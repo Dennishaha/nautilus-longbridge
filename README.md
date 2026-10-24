@@ -6,7 +6,7 @@
 - `nautilus_trader==2.0.0rc7`
 - `longbridge==5.2.2`
 
-当前连接器版本：`0.1.0`（测试版，不声明生产级稳定性）。
+当前连接器版本：`0.1.2`（测试版，不声明生产级稳定性）。
 
 ## 安装
 
@@ -33,7 +33,8 @@ LONGBRIDGE_REGION=hk
 
 连接参数还包括 `LONGBRIDGE_HTTP_URL`、`LONGBRIDGE_QUOTE_WS_URL`、
 `LONGBRIDGE_TRADE_WS_URL`、`LONGBRIDGE_REQUEST_TIMEOUT_SECS`、
-`LONGBRIDGE_RECONNECT_INITIAL_SECS`、`LONGBRIDGE_RECONNECT_MAX_SECS` 和
+`LONGBRIDGE_RECONNECT_INITIAL_SECS`、`LONGBRIDGE_RECONNECT_MAX_SECS`、
+`LONGBRIDGE_RECONNECT_MAX_ATTEMPTS` 和
 `LONGBRIDGE_QUEUE_SIZE`。SDK 5.2.2 对 `hk` 和 `cn` 使用官方 global endpoint；显式 URL
 会覆盖默认值。`region` 用于校验和市场路由标签。
 
@@ -96,13 +97,22 @@ node = builder.build()
 
 - 行情由 `AsyncQuoteContext` 提供，订单由 `AsyncTradeContext` 提供。
 - SDK 回调只入有界队列，转换和去重在客户端所属 event loop 执行。
+- 行情事件使用完整稳定 key 和 300 秒 TTL 去重，容量有界；TradeId 使用完整输入生成的
+  128-bit digest，避免截断摘要导致的碰撞风险。
 - Quote 调用限制为每秒 10 次、并发 5；Trade 调用限制为 30 秒 30 次且间隔不少于 20ms。
+- 限频等待者按 FIFO 发放，取消等待者会从队列移除，不会阻塞后续请求。
 - 订阅状态保存在适配器本地，连接恢复后重放订阅。
+- 数据和执行客户端均有 `DISCONNECTED`、`CONNECTING`、`CONNECTED`、`RECONNECTING`、
+  `FAILED` 状态；健康检查只触发一个重连任务，重连次数受配置限制。
+- 重连后按断连时间和恢复时间回填活跃 Trade 订阅；Quote/Depth 和未完成 Candlestick
+  的时间范围不能由 SDK 5.2.2 安全回填时会明确记录日志。
 - 下单使用 `client_request_id`，超时不会盲目重复提交。
 - 下单数量按 instrument 的 Longbridge board lot 校验；港股非法手数在本地拒绝。
 - 提交超时或响应缺少 venue order ID 时保持 `SUBMITTED`，通过稳定 `remark` 查询对账，禁止自动重复下单。
 - 撤单后轮询终态确认；订单和成交报告优先使用 instrument 的价格精度。
 - 启动 reconciliation 查询订单、成交、持仓和账户资金，并通过 rc7 的 typed reports 送入核心。
+- 成交没有 `execution_id`/`trade_id` 时使用订单、标的、价格、数量、方向和成交时间生成
+  稳定合成 ID，并继续经过同一去重集合。
 - 适配器只通过 NautilusTrader client output API 发送事件，不直接修改 cache 或 engine。
 
 ## 开发与验证

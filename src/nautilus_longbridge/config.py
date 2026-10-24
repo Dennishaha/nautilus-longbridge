@@ -69,6 +69,7 @@ class LongbridgeSafeSettings:
     request_timeout_secs: float = 15.0
     reconnect_initial_secs: float = 1.0
     reconnect_max_secs: float = 30.0
+    reconnect_max_attempts: int = 5
     queue_size: int = 10_000
 
     def validate(self) -> None:
@@ -81,6 +82,8 @@ class LongbridgeSafeSettings:
             or self.reconnect_max_secs < self.reconnect_initial_secs
         ):
             raise ConfigurationError("invalid reconnect backoff")
+        if self.reconnect_max_attempts < 1:
+            raise ConfigurationError("reconnect_max_attempts must be positive")
         if self.queue_size < 1:
             raise ConfigurationError("queue_size must be positive")
 
@@ -128,6 +131,7 @@ class LongbridgeDataClientConfig(_SafeConfigMixin, DataClientConfig):
         request_timeout_secs: float | None = None,
         reconnect_initial_secs: float | None = None,
         reconnect_max_secs: float | None = None,
+        reconnect_max_attempts: int | None = None,
         queue_size: int | None = None,
         price_precision: int = 4,
         price_increment: str = "0.0001",
@@ -158,6 +162,11 @@ class LongbridgeDataClientConfig(_SafeConfigMixin, DataClientConfig):
                 _env_float("LONGBRIDGE_RECONNECT_MAX_SECS", 30.0)
                 if reconnect_max_secs is None
                 else reconnect_max_secs
+            ),
+            reconnect_max_attempts=(
+                _env_int("LONGBRIDGE_RECONNECT_MAX_ATTEMPTS", 5)
+                if reconnect_max_attempts is None
+                else reconnect_max_attempts
             ),
             queue_size=(
                 _env_int("LONGBRIDGE_QUEUE_SIZE", 10_000)
@@ -196,6 +205,7 @@ class LongbridgeExecutionClientConfig(_SafeConfigMixin, ExecutionClientConfig):
         request_timeout_secs: float | None = None,
         reconnect_initial_secs: float | None = None,
         reconnect_max_secs: float | None = None,
+        reconnect_max_attempts: int | None = None,
         queue_size: int | None = None,
         **kwargs: Any,
     ) -> None:
@@ -232,6 +242,11 @@ class LongbridgeExecutionClientConfig(_SafeConfigMixin, ExecutionClientConfig):
                 _env_float("LONGBRIDGE_RECONNECT_MAX_SECS", 30.0)
                 if reconnect_max_secs is None
                 else reconnect_max_secs
+            ),
+            reconnect_max_attempts=(
+                _env_int("LONGBRIDGE_RECONNECT_MAX_ATTEMPTS", 5)
+                if reconnect_max_attempts is None
+                else reconnect_max_attempts
             ),
             queue_size=(
                 _env_int("LONGBRIDGE_QUEUE_SIZE", 10_000)

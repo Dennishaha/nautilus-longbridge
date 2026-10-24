@@ -20,8 +20,6 @@ def _client() -> LongbridgeDataClient:
     client = object.__new__(LongbridgeDataClient)
     client._lb_config = LongbridgeDataClientConfig()
     client.clock = FixedClock()
-    client._seen = __import__("collections").deque(maxlen=100)
-    client._seen_set = set()
     client._last_quotes = {}
     client._last_depth = {}
     provider = LongbridgeInstrumentProvider()

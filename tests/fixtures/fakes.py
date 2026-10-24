@@ -13,6 +13,8 @@ class FakeQuoteContext:
         self.subscription_calls: list[tuple[list[str], list[Any]]] = []
         self.bar_subscriptions: list[tuple[str, Any, Any]] = []
         self.unsubscriptions: list[tuple[list[str], list[Any]]] = []
+        self.trade_values: dict[str, list[Any]] = {}
+        self.subscriptions_exception: BaseException | None = None
 
     def set_on_quote(self, callback: Callable[..., Any]) -> None:
         self.quote_callback = callback
@@ -43,6 +45,8 @@ class FakeQuoteContext:
         ]
 
     async def subscriptions(self) -> list[Any]:
+        if self.subscriptions_exception is not None:
+            raise self.subscriptions_exception
         return self.subscription_calls
 
     async def static_info(self, symbols: list[str]) -> list[Any]:
@@ -52,7 +56,7 @@ class FakeQuoteContext:
         return []
 
     async def trades(self, symbol: str, count: int) -> list[Any]:
-        return []
+        return self.trade_values.get(symbol, [])[:count]
 
     async def candlesticks(
         self, symbol: str, period: Any, count: int, adjust_type: Any, trade_sessions: Any = None
@@ -76,11 +80,14 @@ class FakeTradeContext:
         self.balances: list[Any] = []
         self.positions: Any = []
         self.submit_exception: BaseException | None = None
+        self.subscribe_exception: BaseException | None = None
 
     def set_on_order_changed(self, callback: Callable[..., Any]) -> None:
         self.order_callback = callback
 
     async def subscribe(self, topics: list[Any]) -> None:
+        if self.subscribe_exception is not None:
+            raise self.subscribe_exception
         self.subscribed_topics.extend(topics)
 
     async def unsubscribe(self, topics: list[Any]) -> None:
@@ -125,9 +132,15 @@ class FakeContextFactory:
     def __init__(self) -> None:
         self.quote_context = FakeQuoteContext()
         self.trade_context = FakeTradeContext()
+        self.quote_sequence: list[FakeQuoteContext] = [self.quote_context]
+        self.trade_sequence: list[FakeTradeContext] = [self.trade_context]
 
     def quote(self, settings: Any, loop: Any) -> FakeQuoteContext:
+        if self.quote_sequence:
+            self.quote_context = self.quote_sequence.pop(0)
         return self.quote_context
 
     def trade(self, settings: Any, loop: Any) -> FakeTradeContext:
+        if self.trade_sequence:
+            self.trade_context = self.trade_sequence.pop(0)
         return self.trade_context

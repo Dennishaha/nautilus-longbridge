@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import random
 from collections import defaultdict
@@ -42,6 +43,7 @@ from .config import LongbridgeExecutionClientConfig, assert_order_enabled
 from .constants import TRADE_MARKETS
 from .errors import ConfigurationError, UnsupportedOperation
 from .instruments import LongbridgeInstrumentProvider, validate_lot_size
+from .lifecycle import ConnectionState
 from .mapping import as_decimal, enum_name, price, quantity, timestamp_ns
 from .rate_limit import SlidingWindowRateLimiter
 from .symbols import instrument_id_from_symbol, symbol_from_instrument_id
@@ -173,6 +175,8 @@ class LongbridgeExecutionClient(ExecutionClient):
         self._reconciliation_tasks: dict[str, asyncio.Task[Any]] = {}
         self._trade_rate = SlidingWindowRateLimiter(30, 30.0, min_interval_secs=0.02)
         self._reconnect_lock = asyncio.Lock()
+        self._reconnect_task: asyncio.Task[Any] | None = None
+        self._connection_state = ConnectionState.DISCONNECTED
         instrument_provider = kwargs.pop("instrument_provider", None)
         if instrument_provider is None:
             instrument_provider = LongbridgeInstrumentProvider()
@@ -188,19 +192,22 @@ class LongbridgeExecutionClient(ExecutionClient):
         )
 
     async def _connect(self) -> None:
-        loop = asyncio.get_running_loop()
-        self._queue = asyncio.Queue(maxsize=self._lb_config.settings.queue_size)
-        trade = self._context_factory.trade(self._lb_config.settings, loop)
-        self._trade = trade
-        self._quote = self._context_factory.quote(self._lb_config.settings, loop)
-        if isinstance(self.instrument_provider, LongbridgeInstrumentProvider):
-            self.instrument_provider.set_quote_context(self._quote)
-        trade.set_on_order_changed(self._on_order_changed)
-        self._consumer = self.create_task(self._consume(), "trade-event-consumer")
-        self._health_task = self.create_task(self._health_loop(), "trade-health")
+        self._connection_state = ConnectionState.CONNECTING
         try:
+            loop = asyncio.get_running_loop()
+            self._queue = asyncio.Queue(maxsize=self._lb_config.settings.queue_size)
+            trade = self._context_factory.trade(self._lb_config.settings, loop)
+            self._trade = trade
+            self._quote = self._context_factory.quote(self._lb_config.settings, loop)
+            if isinstance(self.instrument_provider, LongbridgeInstrumentProvider):
+                self.instrument_provider.set_quote_context(self._quote)
+            trade.set_on_order_changed(self._on_order_changed)
+            self._consumer = self.create_task(self._consume(), "trade-event-consumer")
+            self._health_task = self.create_task(self._health_loop(), "trade-health")
             await self._trade_call(lambda: trade.subscribe([_sdk_class("TopicType").Private]))
-        except Exception:
+            self._connection_state = ConnectionState.CONNECTED
+        except BaseException:
+            self._connection_state = ConnectionState.FAILED
             logger.exception("failed to subscribe to Longbridge private order events")
             raise
         await self._emit_account_state()
@@ -213,18 +220,41 @@ class LongbridgeExecutionClient(ExecutionClient):
         while True:
             await asyncio.sleep(max(5.0, self._lb_config.settings.reconnect_initial_secs))
             trade = self._trade
-            if trade is None:
+            if trade is None or self._connection_state is ConnectionState.DISCONNECTED:
                 return
+            if self._connection_state is not ConnectionState.CONNECTED:
+                continue
             try:
                 await self._trade_call(trade.today_orders)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                await self._reconnect_with_backoff()
+                self._start_reconnect()
+
+    def _start_reconnect(self) -> asyncio.Task[Any] | None:
+        existing = self._reconnect_task
+        if existing is not None and not existing.done():
+            return existing
+        self._connection_state = ConnectionState.RECONNECTING
+        task = asyncio.create_task(self._reconnect_loop(), name="longbridge-trade-reconnect")
+        self._reconnect_task = task
+
+        def clear(completed: asyncio.Task[Any]) -> None:
+            if self._reconnect_task is completed:
+                self._reconnect_task = None
+
+        task.add_done_callback(clear)
+        return task
 
     async def _reconnect_with_backoff(self) -> None:
+        task = self._start_reconnect()
+        if task is not None:
+            await task
+
+    async def _reconnect_loop(self) -> None:
         delay = self._lb_config.settings.reconnect_initial_secs
-        while True:
+        max_attempts = self._lb_config.settings.reconnect_max_attempts
+        for attempt in range(max_attempts):
             try:
                 async with self._reconnect_lock:
                     loop = asyncio.get_running_loop()
@@ -234,19 +264,32 @@ class LongbridgeExecutionClient(ExecutionClient):
                         partial(trade.subscribe, [_sdk_class("TopicType").Private])
                     )
                     self._trade = trade
+                self._connection_state = ConnectionState.CONNECTED
+                logger.info("Longbridge trade connection restored")
                 return
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.warning(
-                    "Longbridge trade reconnect failed (%s); retrying in %.1fs",
+                    "Longbridge trade reconnect attempt %d/%d failed (%s); retrying in %.1fs",
+                    attempt + 1,
+                    max_attempts,
                     type(exc).__name__,
                     delay,
                 )
-                await asyncio.sleep(delay * random.uniform(0.8, 1.2))
-                delay = min(self._lb_config.settings.reconnect_max_secs, delay * 2)
+                if attempt + 1 < max_attempts:
+                    await asyncio.sleep(delay * random.uniform(0.8, 1.2))
+                    delay = min(self._lb_config.settings.reconnect_max_secs, delay * 2)
+        self._connection_state = ConnectionState.FAILED
+        logger.error("Longbridge trade reconnection failed after %d attempts", max_attempts)
 
     async def _disconnect(self) -> None:
+        reconnect_task = getattr(self, "_reconnect_task", None)
+        self._reconnect_task = None
+        if reconnect_task is not None and not reconnect_task.done():
+            reconnect_task.cancel()
+            await asyncio.gather(reconnect_task, return_exceptions=True)
+        self._connection_state = ConnectionState.DISCONNECTED
         reconciliation_tasks = list(self._reconciliation_tasks.values())
         for task in reconciliation_tasks:
             task.cancel()
@@ -620,7 +663,7 @@ class LongbridgeExecutionClient(ExecutionClient):
         for value in await self._trade_call(
             lambda: trade.today_executions(order_id=venue_order_id)
         ):
-            execution_id = str(getattr(value, "execution_id", getattr(value, "trade_id", "")))
+            execution_id = self._execution_id(value)
             if not execution_id or execution_id in self._seen_fills:
                 continue
             self._seen_fills.add(execution_id)
@@ -638,6 +681,35 @@ class LongbridgeExecutionClient(ExecutionClient):
                 fill.liquidity_side,
                 fill.ts_event,
             )
+
+    def _execution_id(self, value: Any) -> str:
+        for field in ("execution_id", "trade_id"):
+            raw_value = getattr(value, field, None)
+            if raw_value is not None and str(raw_value).strip():
+                return str(raw_value)
+        raw_key = "|".join(
+            (
+                str(getattr(value, "order_id", "")),
+                str(getattr(value, "symbol", "")),
+                str(getattr(value, "price", "")),
+                str(getattr(value, "quantity", getattr(value, "executed_quantity", ""))),
+                str(getattr(value, "side", "")),
+                str(
+                    getattr(
+                        value,
+                        "executed_at",
+                        getattr(value, "trade_time", getattr(value, "trade_done_at", "")),
+                    )
+                ),
+            )
+        )
+        synthetic = f"SYN-{hashlib.blake2b(raw_key.encode(), digest_size=16).hexdigest()}"
+        logger.warning(
+            "Longbridge execution %s has no execution_id; using synthetic fill ID %s",
+            getattr(value, "order_id", "unknown"),
+            synthetic,
+        )
+        return synthetic
 
     def _client_id_for_venue(self, venue_order_id: str) -> str:
         for client, venue in self._venue_by_client.items():
@@ -755,7 +827,7 @@ class LongbridgeExecutionClient(ExecutionClient):
             AccountId(self._lb_config.account_id),
             instrument_id,
             VenueOrderId(str(value.order_id)),
-            TradeId(str(getattr(value, "execution_id", getattr(value, "trade_id", "")))),
+            TradeId(self._execution_id(value)),
             OrderSide.BUY if "BUY" in enum_name(value.side) else OrderSide.SELL,
             quantity(getattr(value, "quantity", getattr(value, "executed_quantity", 0))),
             price(getattr(value, "price", 0), precision),

@@ -4,9 +4,9 @@ import asyncio
 import hashlib
 import logging
 import random
-from collections import deque
 from collections.abc import Awaitable, Callable
 from functools import partial
+from types import SimpleNamespace
 from typing import Any
 
 from nautilus_trader.live import BarsResponse, QuotesResponse, TradesResponse
@@ -28,7 +28,9 @@ from nautilus_trader.model import (
 )
 
 from .config import LongbridgeDataClientConfig
+from .dedup import TimedDeduplicator
 from .instruments import LongbridgeInstrumentProvider
+from .lifecycle import ConnectionState
 from .mapping import aggressor_side, price, quantity, timestamp_ns
 from .rate_limit import ConcurrencyLimiter, SlidingWindowRateLimiter
 from .symbols import instrument_id_from_symbol, symbol_from_instrument_id
@@ -88,26 +90,41 @@ class LongbridgeDataClient(DataClient):
         self._desired_depth: set[str] = set()
         self._last_quotes: dict[str, Any] = {}
         self._last_depth: dict[str, Any] = {}
-        self._seen: deque[str] = deque(maxlen=20_000)
-        self._seen_set: set[str] = set()
+        self._deduplicator = TimedDeduplicator()
         self._quote_rate = SlidingWindowRateLimiter(10, 1.0)
         self._quote_concurrency = ConcurrencyLimiter(5)
         self._reconnect_lock = asyncio.Lock()
+        self._reconnect_task: asyncio.Task[Any] | None = None
+        self._connection_state = ConnectionState.DISCONNECTED
+        self._disconnect_started_ns: int | None = None
 
     @property
     def quote_context(self) -> QuoteContext | None:
         return self._quote
 
     async def _connect(self) -> None:
-        loop = asyncio.get_running_loop()
-        self._queue = asyncio.Queue(maxsize=self._lb_config.settings.queue_size)
-        self._quote = self._context_factory.quote(self._lb_config.settings, loop)
-        self._configure_quote_context(self._quote)
-        self._consumer = self.create_task(self._consume(), "market-data-consumer")
-        self._health_task = self.create_task(self._health_loop(), "market-data-health")
-        await self._restore_subscriptions()
+        self._connection_state = ConnectionState.CONNECTING
+        try:
+            loop = asyncio.get_running_loop()
+            self._queue = asyncio.Queue(maxsize=self._lb_config.settings.queue_size)
+            self._quote = self._context_factory.quote(self._lb_config.settings, loop)
+            self._configure_quote_context(self._quote)
+            self._consumer = self.create_task(self._consume(), "market-data-consumer")
+            self._health_task = self.create_task(self._health_loop(), "market-data-health")
+            await self._restore_subscriptions()
+            self._connection_state = ConnectionState.CONNECTED
+        except BaseException:
+            self._connection_state = ConnectionState.FAILED
+            raise
 
     async def _disconnect(self) -> None:
+        reconnect_task = getattr(self, "_reconnect_task", None)
+        self._reconnect_task = None
+        if reconnect_task is not None and not reconnect_task.done():
+            reconnect_task.cancel()
+            await asyncio.gather(reconnect_task, return_exceptions=True)
+        self._connection_state = ConnectionState.DISCONNECTED
+        self._disconnect_started_ns = None
         quote = self._quote
         if quote is not None:
             from longbridge.openapi import SubType
@@ -129,16 +146,7 @@ class LongbridgeDataClient(DataClient):
                     )
             except Exception:
                 logger.debug("Longbridge quote unsubscribe during disconnect failed", exc_info=True)
-            for setter in (
-                quote.set_on_quote,
-                quote.set_on_depth,
-                quote.set_on_trades,
-                quote.set_on_candlestick,
-            ):
-                try:
-                    setter(lambda *args: None)
-                except Exception:
-                    logger.debug("Longbridge quote callback cleanup failed", exc_info=True)
+            self._clear_quote_callbacks(quote)
         if isinstance(self.instrument_provider, LongbridgeInstrumentProvider):
             self.instrument_provider.set_quote_context(None)
         for task in (self._health_task, self._consumer):
@@ -155,16 +163,18 @@ class LongbridgeDataClient(DataClient):
     async def _health_loop(self) -> None:
         while True:
             await asyncio.sleep(max(5.0, self._lb_config.settings.reconnect_initial_secs))
-            if self._quote is not None:
+            if (
+                self._connection_state is ConnectionState.CONNECTED
+                and self._quote is not None
+            ):
                 try:
                     await self._quote_call(self._quote.subscriptions)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    logger.warning(
-                        "Longbridge quote health check failed; SDK context will be recreated by node lifecycle"
-                    )
-                    await self._reconnect_with_backoff()
+                    logger.warning("Longbridge quote health check failed; scheduling reconnect")
+                    self._disconnect_started_ns = self.clock.timestamp_ns()
+                    self._start_reconnect()
 
     def _configure_quote_context(self, quote: QuoteContext) -> None:
         quote.set_on_quote(self._on_quote)
@@ -174,27 +184,120 @@ class LongbridgeDataClient(DataClient):
         if isinstance(self.instrument_provider, LongbridgeInstrumentProvider):
             self.instrument_provider.set_quote_context(quote)
 
+    def _start_reconnect(self) -> asyncio.Task[Any] | None:
+        existing = self._reconnect_task
+        if existing is not None and not existing.done():
+            return existing
+        self._connection_state = ConnectionState.RECONNECTING
+        task = asyncio.create_task(self._reconnect_loop(), name="longbridge-quote-reconnect")
+        self._reconnect_task = task
+
+        def clear(completed: asyncio.Task[Any]) -> None:
+            if self._reconnect_task is completed:
+                self._reconnect_task = None
+
+        task.add_done_callback(clear)
+        return task
+
     async def _reconnect_with_backoff(self) -> None:
+        task = self._start_reconnect()
+        if task is not None:
+            await task
+
+    async def _reconnect_loop(self) -> None:
         delay = self._lb_config.settings.reconnect_initial_secs
-        while True:
+        start_ns = self._disconnect_started_ns or self.clock.timestamp_ns()
+        max_attempts = self._lb_config.settings.reconnect_max_attempts
+        for attempt in range(max_attempts):
             try:
                 async with self._reconnect_lock:
+                    old_quote = self._quote
+                    if old_quote is not None:
+                        self._clear_quote_callbacks(old_quote)
                     loop = asyncio.get_running_loop()
                     quote = self._context_factory.quote(self._lb_config.settings, loop)
                     self._configure_quote_context(quote)
                     self._quote = quote
                     await self._restore_subscriptions()
+                    reconnect_ns = self.clock.timestamp_ns()
+                    await self._backfill_gap(start_ns, reconnect_ns)
+                self._disconnect_started_ns = None
+                self._connection_state = ConnectionState.CONNECTED
+                logger.info("Longbridge quote connection restored")
                 return
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.warning(
-                    "Longbridge quote reconnect failed (%s); retrying in %.1fs",
+                    "Longbridge quote reconnect attempt %d/%d failed (%s); retrying in %.1fs",
+                    attempt + 1,
+                    max_attempts,
                     type(exc).__name__,
                     delay,
                 )
-                await asyncio.sleep(delay * random.uniform(0.8, 1.2))
-                delay = min(self._lb_config.settings.reconnect_max_secs, delay * 2)
+                if attempt + 1 < max_attempts:
+                    await asyncio.sleep(delay * random.uniform(0.8, 1.2))
+                    delay = min(self._lb_config.settings.reconnect_max_secs, delay * 2)
+        self._connection_state = ConnectionState.FAILED
+        logger.error("Longbridge quote reconnection failed after %d attempts", max_attempts)
+
+    @staticmethod
+    def _clear_quote_callbacks(quote: QuoteContext) -> None:
+        for setter in (
+            quote.set_on_quote,
+            quote.set_on_depth,
+            quote.set_on_trades,
+            quote.set_on_candlestick,
+        ):
+            try:
+                setter(lambda *args: None)
+            except Exception:
+                logger.debug("Longbridge quote callback cleanup failed", exc_info=True)
+
+    async def _backfill_gap(self, start_ns: int, end_ns: int) -> None:
+        """Backfill trades during a disconnect, using the same dedup path as pushes."""
+        if end_ns <= start_ns or self._quote is None:
+            return
+        gap_seconds = (end_ns - start_ns) / 1_000_000_000
+        logger.warning(
+            "Longbridge quote connection gap %.3fs; backfilling trade subscriptions",
+            gap_seconds,
+        )
+        quote = self._quote
+        if quote is None:
+            return
+        for symbol in sorted(self._desired_trades):
+            try:
+                async def fetch_trades(symbol: str = symbol) -> list[Any]:
+                    return await quote.trades(symbol, 1000)
+
+                values = await self._quote_call(fetch_trades)
+                missing: list[Any] = []
+                for item in values:
+                    value = getattr(item, "timestamp", None)
+                    if value is None:
+                        continue
+                    item_ns = timestamp_ns(value, end_ns)
+                    if start_ns <= item_ns <= end_ns:
+                        missing.append(item)
+                if missing:
+                    await self._publish_trades(symbol, SimpleNamespace(trades=missing))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "Longbridge trade backfill failed for %s: %s", symbol, type(exc).__name__
+                )
+        if self._desired_quotes:
+            logger.warning(
+                "Longbridge quote snapshots cannot be backfilled with an event-time range; "
+                "live quote/depth snapshots will resume after reconnect"
+            )
+        if self._desired_bars:
+            logger.warning(
+                "Longbridge candlestick gap cannot be backfilled safely without a completed-bar "
+                "boundary; live candlesticks will resume after reconnect"
+            )
 
     async def _restore_subscriptions(self) -> None:
         quote = self._quote
@@ -265,13 +368,31 @@ class LongbridgeDataClient(DataClient):
                 self._queue.task_done()
 
     def _dedup(self, key: str) -> bool:
-        if key in self._seen_set:
-            return False
-        if len(self._seen) == self._seen.maxlen:
-            self._seen_set.discard(self._seen[0])
-        self._seen.append(key)
-        self._seen_set.add(key)
-        return True
+        if not hasattr(self, "_deduplicator"):
+            self._deduplicator = TimedDeduplicator()
+        return self._deduplicator.add(key)
+
+    @staticmethod
+    def _trade_key(symbol: str, item: Any, ts_event: int) -> str:
+        return "|".join(
+            (
+                symbol,
+                str(ts_event),
+                str(getattr(item, "price", "")),
+                str(getattr(item, "volume", "")),
+                str(getattr(item, "direction", "")),
+                str(getattr(item, "trade_type", "")),
+            )
+        )
+
+    @classmethod
+    def _trade_digest(cls, symbol: str, item: Any, ts_event: int) -> str:
+        # TradeId is limited to 36 characters by NautilusTrader. The complete
+        # un-hashed key is still used for deduplication; this is a full
+        # 128-bit digest rather than a truncated SHA-1 prefix for the ID.
+        return hashlib.blake2b(
+            cls._trade_key(symbol, item, ts_event).encode(), digest_size=16
+        ).hexdigest()
 
     async def _publish_quote(self, symbol: str, event: Any) -> None:
         self._last_quotes[symbol] = event
@@ -306,7 +427,7 @@ class LongbridgeDataClient(DataClient):
 
     async def _publish_depth(self, symbol: str, event: Any) -> None:
         self._last_depth[symbol] = event
-        ts_event = self.clock.timestamp_ns()
+        ts_event = timestamp_ns(getattr(event, "timestamp", None), self.clock.timestamp_ns())
         instrument_id = await self._ensure_instrument(symbol)
         bids = [
             row for row in getattr(event, "bids", []) if getattr(row, "price", None) is not None
@@ -314,7 +435,10 @@ class LongbridgeDataClient(DataClient):
         asks = [
             row for row in getattr(event, "asks", []) if getattr(row, "price", None) is not None
         ]
-        key = f"depth:{symbol}:{[(str(x.price), x.volume) for x in bids]}:{[(str(x.price), x.volume) for x in asks]}"
+        key = (
+            f"depth:{symbol}:{ts_event}:{[(str(x.price), x.volume) for x in bids]}:"
+            f"{[(str(x.price), x.volume) for x in asks]}"
+        )
         if not self._dedup(key):
             return
         self._handle_data(
@@ -349,13 +473,15 @@ class LongbridgeDataClient(DataClient):
 
     async def _publish_trades(self, symbol: str, event: Any) -> None:
         instrument_id = await self._ensure_instrument(symbol)
-        for item in getattr(event, "trades", []):
-            ts_event = timestamp_ns(getattr(item, "timestamp", None), self.clock.timestamp_ns())
-            raw_key = (
-                f"{symbol}:{ts_event}:{item.price}:{item.volume}:{getattr(item, 'trade_type', '')}"
-            )
-            digest = hashlib.sha1(raw_key.encode(), usedforsecurity=False).hexdigest()[:20]
-            if not self._dedup(f"trade:{digest}"):
+        fallback_ns = self.clock.timestamp_ns()
+        items = sorted(
+            getattr(event, "trades", []),
+            key=lambda item: timestamp_ns(getattr(item, "timestamp", None), fallback_ns),
+        )
+        for item in items:
+            ts_event = timestamp_ns(getattr(item, "timestamp", None), fallback_ns)
+            digest = self._trade_digest(symbol, item, ts_event)
+            if not self._dedup(f"trade:{self._trade_key(symbol, item, ts_event)}"):
                 continue
             self._handle_data(
                 TradeTick(
@@ -500,9 +626,7 @@ class LongbridgeDataClient(DataClient):
         data: list[Any] = []
         for item in values:
             ts_event = timestamp_ns(getattr(item, "timestamp", None), self.clock.timestamp_ns())
-            digest = hashlib.sha1(
-                f"{symbol}:{ts_event}:{item.price}:{item.volume}".encode(), usedforsecurity=False
-            ).hexdigest()[:20]
+            digest = self._trade_digest(symbol, item, ts_event)
             data.append(
                 TradeTick(
                     request.instrument_id,
