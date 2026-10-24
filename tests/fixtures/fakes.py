@@ -10,7 +10,7 @@ class FakeQuoteContext:
         self.depth_callback: Callable[..., Any] | None = None
         self.trade_callback: Callable[..., Any] | None = None
         self.bar_callback: Callable[..., Any] | None = None
-        self.subscriptions: list[tuple[list[str], list[Any]]] = []
+        self.subscription_calls: list[tuple[list[str], list[Any]]] = []
         self.bar_subscriptions: list[tuple[str, Any, Any]] = []
         self.unsubscriptions: list[tuple[list[str], list[Any]]] = []
 
@@ -27,7 +27,7 @@ class FakeQuoteContext:
         self.bar_callback = callback
 
     async def subscribe(self, symbols: list[str], sub_types: list[Any]) -> None:
-        self.subscriptions.append((symbols, sub_types))
+        self.subscription_calls.append((symbols, sub_types))
 
     async def unsubscribe(self, symbols: list[str], sub_types: list[Any]) -> None:
         self.unsubscriptions.append((symbols, sub_types))
@@ -43,7 +43,7 @@ class FakeQuoteContext:
         ]
 
     async def subscriptions(self) -> list[Any]:
-        return self.subscriptions
+        return self.subscription_calls
 
     async def static_info(self, symbols: list[str]) -> list[Any]:
         return []

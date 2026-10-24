@@ -25,9 +25,9 @@ async def test_quote_subscription_is_replayed_after_local_reconnect() -> None:
 
     await client._restore_subscriptions()
 
-    assert factory.quote_context.subscriptions
-    assert factory.quote_context.subscriptions[0][0] == ["700.HK"]
-    assert factory.quote_context.subscriptions[1][0] == ["AAPL.US"]
+    assert factory.quote_context.subscription_calls
+    assert factory.quote_context.subscription_calls[0][0] == ["700.HK"]
+    assert factory.quote_context.subscription_calls[1][0] == ["AAPL.US"]
 
 
 @pytest.mark.asyncio
@@ -44,7 +44,7 @@ async def test_quote_command_updates_desired_state() -> None:
 
     assert client._desired_quotes == {"700.HK"}
     assert client._desired_depth == {"700.HK"}
-    assert factory.quote_context.subscriptions
+    assert factory.quote_context.subscription_calls
 
 
 @pytest.mark.asyncio
