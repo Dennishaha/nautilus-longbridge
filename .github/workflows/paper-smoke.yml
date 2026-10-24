@@ -1,0 +1,25 @@
+name: Paper smoke
+
+on:
+  workflow_dispatch:
+
+jobs:
+  paper-smoke:
+    runs-on: ubuntu-latest
+    environment: longbridge-paper
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: uv venv --python 3.14 .venv
+      - run: uv pip install --python .venv/bin/python .
+      - run: .venv/bin/python examples/paper_execution_smoke.py
+        env:
+          LONGBRIDGE_APP_KEY: ${{ secrets.LONGBRIDGE_APP_KEY }}
+          LONGBRIDGE_APP_SECRET: ${{ secrets.LONGBRIDGE_APP_SECRET }}
+          LONGBRIDGE_ACCESS_TOKEN: ${{ secrets.LONGBRIDGE_ACCESS_TOKEN }}
+          LONGBRIDGE_PAPERTRADING: "true"
+          LONGBRIDGE_ENABLE_LIVE_SMOKE: "1"
+          LONGBRIDGE_ENABLE_ORDER_SMOKE: "0"
