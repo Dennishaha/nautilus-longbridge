@@ -75,6 +75,7 @@ class FakeTradeContext:
         self.executions: list[Any] = []
         self.balances: list[Any] = []
         self.positions: Any = []
+        self.submit_exception: BaseException | None = None
 
     def set_on_order_changed(self, callback: Callable[..., Any]) -> None:
         self.order_callback = callback
@@ -103,6 +104,8 @@ class FakeTradeContext:
 
     async def submit_order(self, **kwargs: Any) -> Any:
         self.submitted.append(kwargs)
+        if self.submit_exception is not None:
+            raise self.submit_exception
         return type("SubmitResponse", (), {"order_id": "123"})()
 
     async def replace_order(self, **kwargs: Any) -> None:

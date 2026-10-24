@@ -40,11 +40,12 @@ from nautilus_trader.model import (
 
 from .config import LongbridgeExecutionClientConfig, assert_order_enabled
 from .constants import TRADE_MARKETS
-from .errors import ConfigurationError, SubmissionUncertain, UnsupportedOperation
+from .errors import ConfigurationError, UnsupportedOperation
+from .instruments import LongbridgeInstrumentProvider, validate_lot_size
 from .mapping import as_decimal, enum_name, price, quantity, timestamp_ns
 from .rate_limit import SlidingWindowRateLimiter
 from .symbols import instrument_id_from_symbol, symbol_from_instrument_id
-from .transport import ContextFactory, LongbridgeContextFactory, TradeContext
+from .transport import ContextFactory, LongbridgeContextFactory, QuoteContext, TradeContext
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,7 @@ class LongbridgeExecutionClient(ExecutionClient):
         self._lb_config = config
         self._context_factory = context_factory or LongbridgeContextFactory()
         self._trade: TradeContext | None = None
+        self._quote: QuoteContext | None = None
         self._queue: asyncio.Queue[Any] | None = None
         self._consumer: asyncio.Task[Any] | None = None
         self._health_task: asyncio.Task[Any] | None = None
@@ -168,8 +170,12 @@ class LongbridgeExecutionClient(ExecutionClient):
         self._seen_fills: set[str] = set()
         self._last_filled: defaultdict[str, Decimal] = defaultdict(Decimal)
         self._last_status: dict[str, OrderStatus] = {}
+        self._reconciliation_tasks: dict[str, asyncio.Task[Any]] = {}
         self._trade_rate = SlidingWindowRateLimiter(30, 30.0, min_interval_secs=0.02)
         self._reconnect_lock = asyncio.Lock()
+        instrument_provider = kwargs.pop("instrument_provider", None)
+        if instrument_provider is None:
+            instrument_provider = LongbridgeInstrumentProvider()
         super().__init__(
             config=config,
             venue=Venue("LONGBRIDGE"),
@@ -177,6 +183,7 @@ class LongbridgeExecutionClient(ExecutionClient):
             account_type=AccountType.CASH,
             oms_type=OmsType.NETTING,
             base_currency=Currency.from_str(config.base_currency),
+            instrument_provider=instrument_provider,
             **kwargs,
         )
 
@@ -185,6 +192,9 @@ class LongbridgeExecutionClient(ExecutionClient):
         self._queue = asyncio.Queue(maxsize=self._lb_config.settings.queue_size)
         trade = self._context_factory.trade(self._lb_config.settings, loop)
         self._trade = trade
+        self._quote = self._context_factory.quote(self._lb_config.settings, loop)
+        if isinstance(self.instrument_provider, LongbridgeInstrumentProvider):
+            self.instrument_provider.set_quote_context(self._quote)
         trade.set_on_order_changed(self._on_order_changed)
         self._consumer = self.create_task(self._consume(), "trade-event-consumer")
         self._health_task = self.create_task(self._health_loop(), "trade-health")
@@ -237,6 +247,12 @@ class LongbridgeExecutionClient(ExecutionClient):
                 delay = min(self._lb_config.settings.reconnect_max_secs, delay * 2)
 
     async def _disconnect(self) -> None:
+        reconciliation_tasks = list(self._reconciliation_tasks.values())
+        for task in reconciliation_tasks:
+            task.cancel()
+        if reconciliation_tasks:
+            await asyncio.gather(*reconciliation_tasks, return_exceptions=True)
+        self._reconciliation_tasks.clear()
         trade = self._trade
         if trade is not None:
             try:
@@ -249,6 +265,21 @@ class LongbridgeExecutionClient(ExecutionClient):
                 trade.set_on_order_changed(lambda *args: None)
             except Exception:
                 logger.debug("Longbridge trade callback cleanup failed", exc_info=True)
+        if isinstance(self.instrument_provider, LongbridgeInstrumentProvider):
+            self.instrument_provider.set_quote_context(None)
+        quote = self._quote
+        if quote is not None:
+            for setter in (
+                quote.set_on_quote,
+                quote.set_on_depth,
+                quote.set_on_trades,
+                quote.set_on_candlestick,
+            ):
+                try:
+                    setter(lambda *args: None)
+                except Exception:
+                    logger.debug("Longbridge execution quote callback cleanup failed", exc_info=True)
+        self._quote = None
         tasks = [task for task in (self._consumer, self._health_task) if task is not None]
         for task in tasks:
             task.cancel()
@@ -289,7 +320,11 @@ class LongbridgeExecutionClient(ExecutionClient):
             return
         filled = as_decimal(getattr(event, "executed_quantity", 0))
         total = as_decimal(
-            getattr(event, "submitted_quantity", getattr(order.quantity, "as_decimal", lambda: 0)())
+            getattr(
+                event,
+                "submitted_quantity",
+                getattr(event, "quantity", getattr(order.quantity, "as_decimal", lambda: 0)()),
+            )
         )
         status = map_status(getattr(event, "status", None), filled, total)
         venue_id = VenueOrderId(venue_order_id)
@@ -326,6 +361,8 @@ class LongbridgeExecutionClient(ExecutionClient):
             order_quantity = order.quantity.as_decimal()
             if order_quantity <= 0:
                 raise ConfigurationError("order quantity must be positive")
+            instrument = await self._load_instrument(order.instrument_id, symbol)
+            validate_lot_size(order_quantity, instrument.lot_size.as_decimal(), symbol)
             if order_type is _sdk_class("OrderType").LO and (
                 getattr(order, "price", None) is None or order.price.as_decimal() <= 0
             ):
@@ -356,22 +393,124 @@ class LongbridgeExecutionClient(ExecutionClient):
                     expire_date=expire_date,
                     outside_rth=None,
                     client_request_id=client_request_id(order.client_order_id),
+                    remark=client_request_id(order.client_order_id),
                 )
             )
-        except TimeoutError as exc:
-            raise SubmissionUncertain(
-                "Longbridge submit timed out; reconciliation is required"
-            ) from exc
+        except TimeoutError:
+            logger.error(
+                "Longbridge submit timed out for %s; keeping order submitted and reconciling",
+                order.client_order_id,
+            )
+            self._schedule_reconciliation(str(order.client_order_id))
+            return
         except Exception as exc:
             self._pending_orders.pop(str(order.client_order_id), None)
             self.generate_order_rejected(order, str(exc), self.clock.timestamp_ns(), False)
             return
         venue_id = str(getattr(response, "order_id", ""))
         if not venue_id:
-            raise SubmissionUncertain("Longbridge submit returned no venue order ID")
+            logger.error(
+                "Longbridge submit returned no venue order ID for %s; reconciling",
+                order.client_order_id,
+            )
+            self._schedule_reconciliation(str(order.client_order_id))
+            return
         self._venue_by_client[str(order.client_order_id)] = venue_id
         self._last_status[str(order.client_order_id)] = OrderStatus.ACCEPTED
         self.generate_order_accepted(order, VenueOrderId(venue_id), self.clock.timestamp_ns())
+
+    async def _load_instrument(self, instrument_id: Any, symbol: str) -> Any:
+        provider = self.instrument_provider
+        instrument = provider.find(instrument_id) if provider is not None else None
+        if instrument is not None:
+            return instrument
+        if not isinstance(provider, LongbridgeInstrumentProvider):
+            raise ConfigurationError(f"instrument metadata unavailable for {symbol}")
+        if self._quote is None:
+            raise ConfigurationError(
+                f"instrument metadata unavailable for {symbol}; execution client is not connected"
+            )
+        await provider.load_symbols_async([symbol])
+        instrument = provider.find(instrument_id)
+        if instrument is None:
+            raise ConfigurationError(f"instrument metadata not found for {symbol}")
+        return instrument
+
+    def _schedule_reconciliation(self, client_order_id: str) -> None:
+        existing = self._reconciliation_tasks.get(client_order_id)
+        if existing is not None and not existing.done():
+            return
+        coroutine = self._reconcile_uncertain_order(client_order_id)
+        task_factory = getattr(self, "create_task", None)
+        if callable(task_factory) and getattr(self, "_runtime", None) is not None:
+            task = task_factory(coroutine, f"reconcile-{client_order_id}")
+        else:
+            task = asyncio.create_task(coroutine, name=f"reconcile-{client_order_id}")
+        self._reconciliation_tasks[client_order_id] = task
+        task.add_done_callback(
+            lambda _: self._reconciliation_tasks.pop(client_order_id, None)
+        )
+
+    async def _reconcile_uncertain_order(
+        self, client_order_id: str, *, max_attempts: int = 5
+    ) -> bool:
+        """Resolve a timed-out submission without ever submitting it again."""
+        order = self._pending_orders.get(client_order_id)
+        if order is None or self._trade is None:
+            return False
+        request_id = client_request_id(client_order_id)
+        for attempt in range(max_attempts):
+            try:
+                values = await self._trade_call(self._trade.today_orders)
+                matches = [
+                    value
+                    for value in values
+                    if self._matches_pending_order(value, order, request_id)
+                ]
+                if len(matches) == 1:
+                    venue_id = str(matches[0].order_id)
+                    self._venue_by_client[client_order_id] = venue_id
+                    await self._process_order_event(matches[0])
+                    logger.info(
+                        "Reconciled uncertain Longbridge order %s as venue order %s",
+                        client_order_id,
+                        venue_id,
+                    )
+                    return True
+                if len(matches) > 1:
+                    logger.error(
+                        "Multiple Longbridge orders matched uncertain client order %s",
+                        client_order_id,
+                    )
+                    return False
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Longbridge order reconciliation attempt %d/%d failed for %s: %s",
+                    attempt + 1,
+                    max_attempts,
+                    client_order_id,
+                    type(exc).__name__,
+                )
+            if attempt + 1 < max_attempts:
+                await asyncio.sleep(min(2**attempt, 16))
+        logger.error(
+            "Longbridge order %s remains in unknown state after reconciliation",
+            client_order_id,
+        )
+        return False
+
+    @staticmethod
+    def _matches_pending_order(value: Any, order: Any, request_id: str) -> bool:
+        for field in ("client_order_id", "client_request_id", "remark"):
+            raw_value = getattr(value, field, None)
+            if raw_value is not None and str(raw_value) in {
+                str(order.client_order_id),
+                request_id,
+            }:
+                return True
+        return False
 
     async def _modify_order(self, command: Any) -> None:
         order = command.order
@@ -421,11 +560,27 @@ class LongbridgeExecutionClient(ExecutionClient):
         trade = self._trade
         try:
             await self._trade_call(lambda: trade.cancel_order(venue_id))
-            orders = await self._trade_call(lambda: trade.today_orders(order_id=venue_id))
-            if orders and "CANCEL" in enum_name(getattr(orders[0], "status", None)):
-                self.generate_order_canceled(
-                    order, VenueOrderId(venue_id), self.clock.timestamp_ns()
-                )
+            for attempt in range(10):
+                orders = await self._trade_call(lambda: trade.today_orders(order_id=venue_id))
+                if orders:
+                    value = orders[0]
+                    status = map_status(
+                        getattr(value, "status", None),
+                        as_decimal(getattr(value, "executed_quantity", 0)),
+                        as_decimal(
+                            getattr(
+                                value,
+                                "submitted_quantity",
+                                getattr(value, "quantity", order.quantity.as_decimal()),
+                            )
+                        ),
+                    )
+                    if status in _TERMINAL_STATUSES:
+                        await self._process_order_event(value)
+                        return
+                if attempt < 9:
+                    await asyncio.sleep(0.3)
+            logger.warning("Longbridge cancel confirmation timed out for %s", venue_id)
         except Exception as exc:
             self.generate_order_cancel_rejected(
                 order, VenueOrderId(venue_id), str(exc), self.clock.timestamp_ns()
@@ -559,6 +714,7 @@ class LongbridgeExecutionClient(ExecutionClient):
     def _order_report(self, value: Any) -> OrderStatusReport:
         symbol = str(value.symbol)
         instrument_id = instrument_id_from_symbol(symbol)
+        precision = self._price_precision(instrument_id)
         qty = as_decimal(getattr(value, "submitted_quantity", getattr(value, "quantity", 0)))
         filled = as_decimal(
             getattr(value, "executed_quantity", getattr(value, "filled_quantity", 0))
@@ -583,24 +739,26 @@ class LongbridgeExecutionClient(ExecutionClient):
             client_order_id=ClientOrderId(str(client_id))
             if client_id
             else None,
-            price=price(submitted_price, 4) if submitted_price is not None else None,
+            price=price(submitted_price, precision) if submitted_price is not None else None,
         )
 
     def _fill_report(
         self, value: Any, client_order_id: ClientOrderId | None = None
     ) -> FillReport:
         symbol = str(getattr(value, "symbol", ""))
+        instrument_id = instrument_id_from_symbol(symbol)
+        precision = self._price_precision(instrument_id)
         currency = Currency.from_str(
             str(getattr(value, "currency", self._lb_config.base_currency)).upper()
         )
         return FillReport(
             AccountId(self._lb_config.account_id),
-            instrument_id_from_symbol(symbol),
+            instrument_id,
             VenueOrderId(str(value.order_id)),
             TradeId(str(getattr(value, "execution_id", getattr(value, "trade_id", "")))),
             OrderSide.BUY if "BUY" in enum_name(value.side) else OrderSide.SELL,
             quantity(getattr(value, "quantity", getattr(value, "executed_quantity", 0))),
-            price(getattr(value, "price", 0), 4),
+            price(getattr(value, "price", 0), precision),
             Money.from_decimal(as_decimal(getattr(value, "commission", 0)), currency),
             LiquiditySide.TAKER,
             timestamp_ns(
@@ -619,3 +777,8 @@ class LongbridgeExecutionClient(ExecutionClient):
                 else None
             ),
         )
+
+    def _price_precision(self, instrument_id: Any) -> int:
+        provider = getattr(self, "instrument_provider", None)
+        instrument = provider.find(instrument_id) if provider is not None else None
+        return int(getattr(instrument, "price_precision", 4))

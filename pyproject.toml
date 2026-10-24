@@ -36,6 +36,7 @@ pythonpath = ["."]
 line-length = 100
 target-version = "py313"
 src = ["src", "tests"]
+exclude = ["DEFECT_FIXES.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]

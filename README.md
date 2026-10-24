@@ -99,6 +99,9 @@ node = builder.build()
 - Quote 调用限制为每秒 10 次、并发 5；Trade 调用限制为 30 秒 30 次且间隔不少于 20ms。
 - 订阅状态保存在适配器本地，连接恢复后重放订阅。
 - 下单使用 `client_request_id`，超时不会盲目重复提交。
+- 下单数量按 instrument 的 Longbridge board lot 校验；港股非法手数在本地拒绝。
+- 提交超时或响应缺少 venue order ID 时保持 `SUBMITTED`，通过稳定 `remark` 查询对账，禁止自动重复下单。
+- 撤单后轮询终态确认；订单和成交报告优先使用 instrument 的价格精度。
 - 启动 reconciliation 查询订单、成交、持仓和账户资金，并通过 rc7 的 typed reports 送入核心。
 - 适配器只通过 NautilusTrader client output API 发送事件，不直接修改 cache 或 engine。
 

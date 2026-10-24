@@ -7,8 +7,21 @@ from nautilus_trader.live.providers import InstrumentProvider
 from nautilus_trader.model import Currency, Equity, InstrumentId, Price, Quantity, Symbol
 
 from .config import market_for_symbol
-from .errors import UnsupportedOperation
+from .errors import ConfigurationError, UnsupportedOperation
 from .symbols import instrument_id_from_symbol, symbol_from_instrument_id
+
+
+def validate_lot_size(order_quantity: Decimal, lot_size: Decimal, symbol: str) -> None:
+    """Validate an equity order quantity against the venue board lot."""
+    if order_quantity <= 0:
+        raise ConfigurationError("order quantity must be positive")
+    if lot_size <= 0:
+        raise ConfigurationError(f"invalid lot size {lot_size} for {symbol}")
+    if order_quantity % lot_size != 0:
+        raise ConfigurationError(
+            f"order quantity {order_quantity} for {symbol} must be a multiple of lot size "
+            f"{lot_size}"
+        )
 
 
 class LongbridgeInstrumentProvider(InstrumentProvider):
