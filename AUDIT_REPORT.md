@@ -1,9 +1,9 @@
 # 长桥-NautilusTrader 连接器审计报告
 
-**审计日期**: 2026-10-24  
-**连接器版本**: 0.1.0  
-**NautilusTrader 版本**: 2.0.0rc7  
-**Longbridge SDK 版本**: 5.2.2  
+**审计日期**: 2026-10-24
+**连接器版本**: 0.1.0
+**NautilusTrader 版本**: 2.0.0rc7
+**Longbridge SDK 版本**: 5.2.2
 **Python 版本**: 3.13/3.14
 
 ---
@@ -239,14 +239,14 @@ class TimedDeduplicator:
         self._seen: dict[str, float] = {}
         self._ttl = ttl_secs
         self._last_cleanup = time.monotonic()
-    
+
     def is_duplicate(self, key: str) -> bool:
         now = time.monotonic()
         # 定期清理过期记录
         if now - self._last_cleanup > 60.0:
             self._seen = {k: v for k, v in self._seen.items() if now - v < self._ttl}
             self._last_cleanup = now
-        
+
         if key in self._seen:
             return True
         self._seen[key] = now
@@ -274,7 +274,7 @@ except TimeoutError as exc:
     ) from exc
 ```
 
-**影响**: 
+**影响**:
 - 订单可能已提交但未收到确认
 - NautilusTrader 核心无法正确处理这个状态
 - 需要手动 reconciliation
@@ -316,7 +316,7 @@ async def _reconcile_uncertain_order(self, client_order_id: str) -> None:
 
 **位置**: `data.py:177-197`, `execution.py:215-237`
 
-**问题**: 
+**问题**:
 1. 重连时，旧的 context 被丢弃，但队列中可能还有未处理的事件
 2. 重连期间 SDK 推送的事件会丢失（因为回调已更新到新 context）
 3. 没有持久化订阅状态到磁盘
@@ -345,7 +345,7 @@ async def _reconnect_with_backoff(self) -> None:
     disconnect_time = self.clock.timestamp_ns()
     # ... 重连逻辑 ...
     reconnect_time = self.clock.timestamp_ns()
-    
+
     # 查询重连期间的数据
     await self._backfill_gap(disconnect_time, reconnect_time)
 
@@ -446,14 +446,14 @@ class FairSlidingWindowRateLimiter:
         self._lock = asyncio.Lock()
         self._queue: asyncio.Queue[asyncio.Event] = asyncio.Queue()  # FIFO 队列
         self._processor_task: asyncio.Task | None = None
-    
+
     async def acquire(self) -> None:
         event = asyncio.Event()
         await self._queue.put(event)
         if self._processor_task is None or self._processor_task.done():
             self._processor_task = asyncio.create_task(self._process_queue())
         await event.wait()
-    
+
     async def _process_queue(self) -> None:
         while not self._queue.empty():
             event = await self._queue.get()
@@ -503,7 +503,7 @@ async def _health_loop(self) -> None:
 async def _reconnect_with_backoff(self) -> None:
     if self._connection_state == ConnectionState.RECONNECTING:
         return  # 已有重连任务
-    
+
     async with self._reconnect_lock:
         for attempt in range(5):  # 限制重连次数
             try:
@@ -566,7 +566,7 @@ logger.warning("Cancel confirmation timeout for %s", venue_id)
 
 **位置**: 多处使用 `price(..., 4)` 和 `self._lb_config.price_precision`
 
-**问题**: 
+**问题**:
 1. 不同市场/证券的价格精度不同（港股可能是 3 位，A 股是 2 位）
 2. 配置中的 `price_precision=4` 和 `price_increment="0.0001"` 是全局默认值
 
@@ -587,7 +587,7 @@ class LongbridgeInstrumentProvider:
         else:  # US
             price_precision = 4
             price_increment = Decimal("0.0001")
-        
+
         instrument = Equity(
             instrument_id=instrument_id,
             price_precision=price_precision,
@@ -732,19 +732,19 @@ if order_quantity % lot_size != 0:
 # test_edge_cases.py
 async def test_empty_depth_does_not_generate_quote():
     """空 depth 不应生成 QuoteTick"""
-    
+
 async def test_null_price_is_skipped():
     """null 价格应被跳过"""
-    
+
 async def test_rate_limit_blocks_when_exceeded():
     """超过速率限制应阻塞"""
-    
+
 async def test_reconnect_restores_all_subscriptions():
     """重连后应恢复所有订阅"""
-    
+
 async def test_order_submission_retries_on_network_error():
     """网络错误应重试"""
-    
+
 async def test_concurrent_orders_preserve_sequence():
     """并发订单应保持顺序"""
 ```
@@ -917,14 +917,14 @@ LONGBRIDGE_ENABLE_REAL_TRADING=1
 ### 短期（1-2 周）
 
 1. **修复 P0 缺陷**: #2 和 #10
-2. **增加压力测试**: 
+2. **增加压力测试**:
    - 1000 symbol 行情订阅
    - 100 并发订单
    - 长时间运行（24小时）
-3. **纸面交易验证**: 
+3. **纸面交易验证**:
    - 港股: 700.HK (腾讯), 9988.HK (阿里)
    - 美股: AAPL.US, TSLA.US
-4. **增加监控**: 
+4. **增加监控**:
    - 订单延迟（提交 → 确认）
    - 行情延迟（交易所 → 本地）
    - 重连次数和原因
@@ -1025,7 +1025,7 @@ LONGBRIDGE_ENABLE_REAL_TRADING=1
 | ruff | 0.9+ | < 1 | 0.9.x |
 | mypy | 1.13+ | < 2 | 1.13.x |
 
-**升级建议**: 
+**升级建议**:
 - NautilusTrader 升级到 2.0 正式版时，需要重新测试所有功能
 - Longbridge SDK 升级时，需要验证 API 兼容性
 
@@ -1088,13 +1088,13 @@ TOML                          1            7            0           42
 
 ## 审计签名
 
-**审计人**: Claude Opus 5.5  
-**审计日期**: 2026-10-24  
-**审计范围**: 完整代码库、测试、文档  
-**审计方法**: 静态代码审查、测试执行、架构分析  
-**审计时长**: 约 2 小时  
+**审计人**: Claude Opus 5.5
+**审计日期**: 2026-10-24
+**审计范围**: 完整代码库、测试、文档
+**审计方法**: 静态代码审查、测试执行、架构分析
+**审计时长**: 约 2 小时
 
-**审计声明**: 
+**审计声明**:
 本审计报告基于当前代码库状态（commit `11e44ac`）进行。所有发现的缺陷和建议均基于最佳实践和行业标准。实际修复优先级应根据业务需求和资源情况调整。
 
 ---
