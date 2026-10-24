@@ -254,7 +254,10 @@ class LongbridgeExecutionClientConfig(_SafeConfigMixin, ExecutionClientConfig):
                 else queue_size
             ),
         )
-        self.account_id = account_id
+        # Nautilus AccountId requires an issuer-number separator; broker account
+        # numbers may omit it. Keep already-qualified Nautilus IDs unchanged.
+        account_id = account_id.strip()
+        self.account_id = account_id if "-" in account_id else f"LONGBRIDGE-{account_id}"
         self.base_currency = base_currency.upper()
         self.settings.validate()
         self._safe_values = {
