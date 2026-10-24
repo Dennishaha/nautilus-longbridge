@@ -443,7 +443,7 @@ async def test_health_check_prevents_duplicate_reconnects():
   并通过 `_seen_fills` 去重。
 - 行情和交易限频器均按 FIFO 发放，取消 waiter 会从队列移除；两类客户端均使用统一连接状态和
   单一 reconnect task，失败达到 `LONGBRIDGE_RECONNECT_MAX_ATTEMPTS` 后进入 `FAILED`。
-- 离线验证：38 个测试通过，Ruff 和 mypy 通过；未使用真实 Longbridge 凭证或真实订单。
+- 离线验证：Python 3.13/3.14 均为 41 个测试通过，Ruff、mypy 和 `uv build` 通过；未使用真实 Longbridge 凭证或真实订单。
 
 ---
 
