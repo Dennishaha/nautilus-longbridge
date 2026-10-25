@@ -1,0 +1,4 @@
+include CHANGELOG.md
+include .env.example
+recursive-include examples *.py
+recursive-include tests *.py

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.5 — 2026-10-25
 
 ### Bar catalog persistence
 
@@ -14,6 +14,17 @@
 - Drain accepted market-data events before stopping the adapter consumer.
 - Verify minute/hour/day Bar and Equity round trips through a native LiveNode
   and ParquetDataCatalog, including catalog visibility while the node runs.
+
+### Validation and scope
+
+- 84 connector tests pass locally on Python 3.14 with NautilusTrader 2.0.0rc7
+  and Longbridge 5.2.2; Ruff and mypy pass.
+- Native integration tests cover periodic and close-time promotion, retained
+  Feather recovery, and rejection of overlapping manual imports in rc7.
+- Source distributions include the changelog, example configuration, recorder
+  scripts and test fixtures.
+- Recording covers confirmed live bars. Historical gap backfill and business-key
+  deduplication across separate runs are not included.
 
 ## 0.1.4
 
