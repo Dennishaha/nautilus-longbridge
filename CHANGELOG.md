@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Bar catalog persistence
+
+- Add `bar_catalog_streaming` and a runnable market-data recorder using NT's
+  native streaming lifecycle, periodic Parquet promotion, close-time promotion
+  and retained Feather sources for recovery.
+- Correct SDK 5.2.2 period conversion (`Min_60` for hourly bars and enums without
+  `.name`); reject unsupported periods and non-LAST/non-external bar requests.
+- Track subscriptions by symbol and period. Preserve full OHLCV and confirmation
+  state in update deduplication; suppress repeated/stale confirmed live frames.
+- Drain accepted market-data events before stopping the adapter consumer.
+- Verify minute/hour/day Bar and Equity round trips through a native LiveNode
+  and ParquetDataCatalog, including catalog visibility while the node runs.
+
 ## 0.1.4
 
 ### Paper cross-currency margin

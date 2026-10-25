@@ -80,6 +80,73 @@ node = builder.build()
 
 策略只使用 NautilusTrader 的标准订阅、历史数据请求和订单 API。策略层不会接触 Longbridge SDK context。
 
+## K 线落盘：Parquet Data Catalog
+
+实时采集使用 NT rc7 的原生链路：`LongbridgeDataClient -> DataEngine -> StreamingConfig ->
+Feather 暂存 -> ParquetDataCatalog`。配置入口：
+
+```python
+from nautilus_trader.common import Environment
+from nautilus_trader.live import LiveNodeBuilder, LiveNodeConfig
+from nautilus_trader.model import TraderId
+from nautilus_longbridge import (
+    LongbridgeDataClientConfig,
+    LongbridgeDataClientFactory,
+    bar_catalog_streaming,
+)
+
+config = LiveNodeConfig(
+    environment=Environment.LIVE,
+    trader_id=TraderId("RECORDER-001"),
+    streaming=bar_catalog_streaming("./data/catalog"),
+)
+node = (
+    LiveNodeBuilder.from_config("longbridge-recorder", config)
+    .add_data_client(
+        "LONGBRIDGE_DATA",
+        LongbridgeDataClientFactory,
+        LongbridgeDataClientConfig(completed_bars_only=True),
+    )
+    .build()
+)
+# 添加订阅 EXTERNAL LAST Bar 的策略，然后 node.run()；退出时在 finally 中 node.dispose()。
+```
+
+可直接运行只采集行情的示例，凭证沿用 `.env`：
+
+```bash
+uv run --python .venv/bin/python --env-file .env examples/record_bars.py \
+  --catalog ./data/catalog --period minute AAPL.US 700.HK
+```
+
+`--period` 支持 `minute`、`hour`、`day`；已有策略可同时订阅同一标的的多个周期。
+采集入口启用 `completed_bars_only=True`，忽略未确认 K 线。同一客户端运行期间按周期保留
+最新确认时间，过滤重复推送、重连重放及较旧的确认帧；同一时间的冲突确认值记录警告并保留首值。
+默认配置仍允许盘中更新；盘中更新与最终确认分别去重，去重键包括完整 OHLCV。
+
+默认每秒 flush 暂存数据、每 60 秒提交到 Catalog，`promotion_interval_ms` 可调整。
+仅 flush 不表示 Parquet 已可查询；周期提交成功后或 `node.dispose()` 关闭写入器后才可查询。
+适配器断开连接时先排空已接收的行情队列，再释放消费者。Catalog 同时保留 Equity 定义，
+可以直接用于 NT 回测；`ts_event` 保留长桥周期开始时间，`ts_init` 保留本地接收/转换时间。
+
+```python
+from nautilus_trader.persistence import ParquetDataCatalog
+
+catalog = ParquetDataCatalog("./data/catalog")
+instruments = catalog.instruments()
+bars = catalog.query_bars(identifiers=["AAPL.US.LONGBRIDGE-1-MINUTE-LAST-EXTERNAL"])
+```
+
+Parquet 位于 `data/catalog/data/bars/<BarType>/`，原始暂存文件保留在
+`data/catalog/live/<instance_id>/`。对尚未提交的 Bar 暂存文件，可使用 NT 的
+`catalog.convert_stream_to_data(instance_id, NautilusDataType.Bar, environment=Environment.LIVE)`
+恢复该次运行（`NautilusDataType` 从 `nautilus_trader.model` 导入）。本项目绑定的 rc7 对
+手动重复转换已提交的暂存文件会报告区间重叠，应先核对现有 Catalog，保留原始暂存文件。
+不同进程重新收到的相同业务 K 线不会
+自动跨运行去重，历史下载及重启期间的缺口也不会由这个实时采集入口自动回补。
+Catalog 路径应由一个采集进程写入。项目默认忽略 `data/` 下的本地行情文件。
+参见 [NT 原生流式 Catalog 文档](https://nautilustrader.io/docs/latest/how_to/stream_parquet_catalog/)。
+
 ## 支持矩阵
 
 | 能力 | 港股 | 美股 | A 股 |

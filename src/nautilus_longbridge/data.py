@@ -47,23 +47,30 @@ def _sdk_enum(name: str, fallback: Any = None) -> Any:
 
 
 def _period_for_bar_type(bar_type: BarType) -> Any:
+    if (
+        bar_type.aggregation_source != AggregationSource.EXTERNAL
+        or bar_type.spec.price_type != PriceType.LAST
+    ):
+        raise ValueError(f"Longbridge requires external LAST bars: {bar_type}")
     name = str(bar_type.spec).upper()
     if name.startswith("1-MINUTE-"):
         return _sdk_enum("Period", {}).Min_1
     if name.startswith("1-HOUR-"):
-        return _sdk_enum("Period", {}).Hour_1
+        return _sdk_enum("Period", {}).Min_60
     if name.startswith("1-DAY-"):
         return _sdk_enum("Period", {}).Day
     raise ValueError(f"unsupported Longbridge bar period: {bar_type.spec}")
 
 
 def _bar_type(instrument_id: InstrumentId, period_name: str) -> BarType:
-    if "MIN" in period_name.upper():
-        spec = BarSpecification(1, BarAggregation.MINUTE, PriceType.LAST)
-    elif "HOUR" in period_name.upper():
-        spec = BarSpecification(1, BarAggregation.HOUR, PriceType.LAST)
-    else:
-        spec = BarSpecification(1, BarAggregation.DAY, PriceType.LAST)
+    aggregations = {
+        "Min_1": BarAggregation.MINUTE,
+        "Min_60": BarAggregation.HOUR,
+        "Day": BarAggregation.DAY,
+    }
+    if period_name not in aggregations:
+        raise ValueError(f"unsupported Longbridge candle period: {period_name}")
+    spec = BarSpecification(1, aggregations[period_name], PriceType.LAST)
     return BarType(instrument_id, spec, AggregationSource.EXTERNAL)
 
 
@@ -87,7 +94,9 @@ class LongbridgeDataClient(DataClient):
         self._health_task: asyncio.Task[Any] | None = None
         self._desired_quotes: set[str] = set()
         self._desired_trades: set[str] = set()
-        self._desired_bars: dict[str, Any] = {}
+        self._desired_bars: dict[tuple[str, str], Any] = {}
+        self._last_confirmed_bars: dict[str, Bar] = {}
+        self._accepting_events = False
         self._desired_depth: set[str] = set()
         self._last_quotes: dict[str, Any] = {}
         self._last_depth: dict[str, Any] = {}
@@ -113,6 +122,7 @@ class LongbridgeDataClient(DataClient):
         try:
             loop = asyncio.get_running_loop()
             self._queue = asyncio.Queue(maxsize=self._lb_config.settings.queue_size)
+            self._accepting_events = True
             self._quote = self._context_factory.quote(self._lb_config.settings, loop)
             self._configure_quote_context(self._quote)
             self._consumer = self.create_task(self._consume(), "market-data-consumer")
@@ -148,23 +158,34 @@ class LongbridgeDataClient(DataClient):
                     await self._quote_call(
                         lambda: quote.unsubscribe(sorted(self._desired_trades), [SubType.Trade])
                     )
-                for symbol, period in self._desired_bars.items():
+                for (symbol, _), period in self._desired_bars.items():
                     await self._quote_call(partial(quote.unsubscribe_candlesticks, symbol, period))
             except Exception:
                 logger.debug("Longbridge quote unsubscribe during disconnect failed", exc_info=True)
             self._clear_quote_callbacks(quote)
-        if isinstance(self.instrument_provider, LongbridgeInstrumentProvider):
-            self.instrument_provider.set_quote_context(None)
-        for task in (self._health_task, self._consumer):
-            if task is not None:
+        self._accepting_events = False
+        try:
+            # Keep the consumer alive until already accepted candles reach NT's
+            # output queue. The node then owns flushing and catalog promotion.
+            queue = getattr(self, "_queue", None)
+            if queue is not None and self._consumer is not None:
+                if self._consumer.done():
+                    await self._consumer  # Surface a failed consumer instead of hanging on join.
+                await asyncio.wait_for(
+                    queue.join(), self._lb_config.settings.request_timeout_secs
+                )
+        finally:
+            if isinstance(self.instrument_provider, LongbridgeInstrumentProvider):
+                self.instrument_provider.set_quote_context(None)
+            tasks = [task for task in (self._health_task, self._consumer) if task is not None]
+            for task in tasks:
                 task.cancel()
-        tasks = [task for task in (self._health_task, self._consumer) if task is not None]
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._health_task = None
-        self._consumer = None
-        self._queue = None
-        self._quote = None
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            self._health_task = None
+            self._consumer = None
+            self._queue = None
+            self._quote = None
 
     async def _health_loop(self) -> None:
         while True:
@@ -322,7 +343,8 @@ class LongbridgeDataClient(DataClient):
             await self._quote_call(
                 lambda: quote.subscribe(sorted(self._desired_trades), [SubType.Trade])
             )
-        for symbol, period in self._desired_bars.items():
+        for (symbol, _), period in self._desired_bars.items():
+            await self._ensure_instrument(symbol)
             await self._quote_call(
                 partial(quote.subscribe_candlesticks, symbol, period, TradeSessions.Intraday)
             )
@@ -337,7 +359,7 @@ class LongbridgeDataClient(DataClient):
         )
 
     def _enqueue(self, kind: str, symbol: str, event: Any) -> None:
-        if self._queue is None:
+        if self._queue is None or not getattr(self, "_accepting_events", True):
             return
         try:
             self._queue.put_nowait((kind, symbol, event, self.clock.timestamp_ns()))
@@ -530,25 +552,40 @@ class LongbridgeDataClient(DataClient):
         if self._lb_config.completed_bars_only and not getattr(event, "is_confirmed", False):
             return
         candle = getattr(event, "candlestick", event)
-        period_name = str(getattr(getattr(event, "period", None), "name", "Min_1"))
+        period = getattr(event, "period", None)
+        # Longbridge 5.2.2 enums expose str(Period.Min_60), but no .name.
+        period_name = str(getattr(period, "name", None) or period).rsplit(".", 1)[-1]
         instrument_id = await self._ensure_instrument(symbol)
         bar_type = _bar_type(instrument_id, period_name)
         ts_event = timestamp_ns(getattr(candle, "timestamp", None), self.clock.timestamp_ns())
-        key = f"bar:{symbol}:{period_name}:{ts_event}:{candle.close}:{candle.volume}"
+        confirmed = bool(getattr(event, "is_confirmed", False))
+        fields = (candle.open, candle.high, candle.low, candle.close, candle.volume)
+        key = f"bar:{symbol}:{period_name}:{ts_event}:{fields}:{confirmed}"
         if not self._dedup(key):
             return
-        self._handle_data(
-            Bar(
-                bar_type,
-                price(candle.open, self._lb_config.price_precision),
-                price(candle.high, self._lb_config.price_precision),
-                price(candle.low, self._lb_config.price_precision),
-                price(candle.close, self._lb_config.price_precision),
-                quantity(candle.volume),
-                ts_event,
-                self.clock.timestamp_ns(),
-            )
+        bar = Bar(
+            bar_type,
+            price(candle.open, self._lb_config.price_precision),
+            price(candle.high, self._lb_config.price_precision),
+            price(candle.low, self._lb_config.price_precision),
+            price(candle.close, self._lb_config.price_precision),
+            quantity(candle.volume),
+            ts_event,
+            self.clock.timestamp_ns(),
         )
+        if self._lb_config.completed_bars_only:
+            if not hasattr(self, "_last_confirmed_bars"):
+                self._last_confirmed_bars = {}
+            previous = self._last_confirmed_bars.get(str(bar_type))
+            if previous is not None and bar.ts_event <= previous.ts_event:
+                if bar.ts_event == previous.ts_event and any(
+                    getattr(bar, field) != getattr(previous, field)
+                    for field in ("open", "high", "low", "close", "volume")
+                ):
+                    logger.warning("Conflicting confirmed candle ignored for %s at %d", bar_type, ts_event)
+                return
+            self._last_confirmed_bars[str(bar_type)] = bar
+        self._handle_data(bar)
 
     async def _ensure_instrument(self, symbol: str) -> InstrumentId:
         instrument_id = instrument_id_from_symbol(symbol)
@@ -608,20 +645,22 @@ class LongbridgeDataClient(DataClient):
     async def _subscribe_bars(self, command: Any) -> None:
         symbol = symbol_from_instrument_id(command.bar_type.instrument_id)
         period = _period_for_bar_type(command.bar_type)
-        self._desired_bars[symbol] = period
+        self._desired_bars[(symbol, str(period))] = period
         quote = self._quote
         if quote is not None:
             from longbridge.openapi import TradeSessions
 
+            await self._ensure_instrument(symbol)
             await self._quote_call(
                 lambda: quote.subscribe_candlesticks(symbol, period, TradeSessions.Intraday)
             )
 
     async def _unsubscribe_bars(self, command: Any) -> None:
         symbol = symbol_from_instrument_id(command.bar_type.instrument_id)
-        period = self._desired_bars.pop(symbol, _period_for_bar_type(command.bar_type))
+        period = _period_for_bar_type(command.bar_type)
+        subscribed = self._desired_bars.pop((symbol, str(period)), None)
         quote = self._quote
-        if quote is not None:
+        if quote is not None and subscribed is not None:
             await self._quote_call(lambda: quote.unsubscribe_candlesticks(symbol, period))
 
     async def _request_quotes(self, request: Any) -> None:
