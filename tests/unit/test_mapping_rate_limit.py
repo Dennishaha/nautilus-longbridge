@@ -34,3 +34,24 @@ def test_rate_limiter_enforces_window() -> None:
         return asyncio.get_running_loop().time() - start
 
     assert asyncio.run(scenario()) >= 0.015
+
+
+def test_sdk_local_naive_timestamp_does_not_get_mislabeled_as_utc(monkeypatch) -> None:
+    import time
+
+    with monkeypatch.context() as patch:
+        patch.setenv("TZ", "Asia/Shanghai")
+        time.tzset()
+        try:
+            # SDK fromtimestamp(..., None) on a Shanghai host.
+            summer = datetime(2025, 3, 10, 21, 30)
+            winter = datetime(2025, 3, 7, 22, 30)
+            assert timestamp_ns(summer, 0) == int(
+                datetime(2025, 3, 10, 13, 30, tzinfo=UTC).timestamp() * 1e9
+            )
+            assert timestamp_ns(winter, 0) == int(
+                datetime(2025, 3, 7, 14, 30, tzinfo=UTC).timestamp() * 1e9
+            )
+        finally:
+            patch.undo()
+            time.tzset()

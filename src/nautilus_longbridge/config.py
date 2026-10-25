@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from contextlib import suppress
 from dataclasses import dataclass
@@ -135,10 +136,14 @@ class LongbridgeDataClientConfig(_SafeConfigMixin, DataClientConfig):
         queue_size: int | None = None,
         price_precision: int = 4,
         price_increment: str = "0.0001",
+        completed_bars_only: bool = False,
+        max_depth_age_secs: float = 2.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        resolved_region = region if region is not None else (_env_text("LONGBRIDGE_REGION", "hk") or "hk")
+        resolved_region = (
+            region if region is not None else (_env_text("LONGBRIDGE_REGION", "hk") or "hk")
+        )
         self.settings = LongbridgeSafeSettings(
             region=resolved_region.lower(),
             paper_trading=_env_bool("LONGBRIDGE_PAPERTRADING", True)
@@ -169,13 +174,15 @@ class LongbridgeDataClientConfig(_SafeConfigMixin, DataClientConfig):
                 else reconnect_max_attempts
             ),
             queue_size=(
-                _env_int("LONGBRIDGE_QUEUE_SIZE", 10_000)
-                if queue_size is None
-                else queue_size
+                _env_int("LONGBRIDGE_QUEUE_SIZE", 10_000) if queue_size is None else queue_size
             ),
         )
         self.price_precision = price_precision
         self.price_increment = price_increment
+        self.completed_bars_only = completed_bars_only
+        self.max_depth_age_secs = max_depth_age_secs
+        if not math.isfinite(max_depth_age_secs) or max_depth_age_secs <= 0:
+            raise ConfigurationError("max_depth_age_secs must be finite and positive")
         self.settings.validate()
         if price_precision < 0 or not price_increment:
             raise ConfigurationError("invalid price precision settings")
@@ -185,6 +192,8 @@ class LongbridgeDataClientConfig(_SafeConfigMixin, DataClientConfig):
             "dry_run": self.settings.dry_run,
             "price_precision": self.price_precision,
             "price_increment": self.price_increment,
+            "completed_bars_only": completed_bars_only,
+            "max_depth_age_secs": max_depth_age_secs,
         }
 
 
@@ -196,6 +205,8 @@ class LongbridgeExecutionClientConfig(_SafeConfigMixin, ExecutionClientConfig):
         *,
         account_id: str | None = None,
         base_currency: str = "USD",
+        account_mode: str = "CASH",
+        max_quote_age_secs: float = 2.0,
         region: str | None = None,
         paper_trading: bool | None = None,
         dry_run: bool | None = None,
@@ -218,7 +229,9 @@ class LongbridgeExecutionClientConfig(_SafeConfigMixin, ExecutionClientConfig):
             raise ConfigurationError("account_id is required")
         if not base_currency.strip():
             raise ConfigurationError("base_currency is required")
-        resolved_region = region if region is not None else (_env_text("LONGBRIDGE_REGION", "hk") or "hk")
+        resolved_region = (
+            region if region is not None else (_env_text("LONGBRIDGE_REGION", "hk") or "hk")
+        )
         self.settings = LongbridgeSafeSettings(
             region=resolved_region.lower(),
             paper_trading=_env_bool("LONGBRIDGE_PAPERTRADING", True)
@@ -249,9 +262,7 @@ class LongbridgeExecutionClientConfig(_SafeConfigMixin, ExecutionClientConfig):
                 else reconnect_max_attempts
             ),
             queue_size=(
-                _env_int("LONGBRIDGE_QUEUE_SIZE", 10_000)
-                if queue_size is None
-                else queue_size
+                _env_int("LONGBRIDGE_QUEUE_SIZE", 10_000) if queue_size is None else queue_size
             ),
         )
         # Nautilus AccountId requires an issuer-number separator; broker account
@@ -260,9 +271,21 @@ class LongbridgeExecutionClientConfig(_SafeConfigMixin, ExecutionClientConfig):
         self.account_id = account_id if "-" in account_id else f"LONGBRIDGE-{account_id}"
         self.base_currency = base_currency.upper()
         self.settings.validate()
+        self.account_mode = account_mode.upper()
+        self.max_quote_age_secs = max_quote_age_secs
+        if self.account_mode not in {"CASH", "MARGIN"}:
+            raise ConfigurationError("account_mode must be CASH or MARGIN")
+        if self.account_mode == "MARGIN" and (
+            not self.settings.paper_trading or self.base_currency != "USD"
+        ):
+            raise ConfigurationError("MARGIN currently requires a USD-base paper account")
+        if not math.isfinite(max_quote_age_secs) or max_quote_age_secs <= 0:
+            raise ConfigurationError("max_quote_age_secs must be finite and positive")
         self._safe_values = {
             "account_id": self.account_id,
             "base_currency": self.base_currency,
+            "account_mode": self.account_mode,
+            "max_quote_age_secs": self.max_quote_age_secs,
             "region": self.settings.region,
             "paper_trading": self.settings.paper_trading,
             "dry_run": self.settings.dry_run,

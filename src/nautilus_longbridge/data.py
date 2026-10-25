@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import random
 from collections.abc import Awaitable, Callable
 from functools import partial
@@ -47,11 +48,11 @@ def _sdk_enum(name: str, fallback: Any = None) -> Any:
 
 def _period_for_bar_type(bar_type: BarType) -> Any:
     name = str(bar_type.spec).upper()
-    if "MIN" in name:
+    if name.startswith("1-MINUTE-"):
         return _sdk_enum("Period", {}).Min_1
-    if "HOUR" in name:
+    if name.startswith("1-HOUR-"):
         return _sdk_enum("Period", {}).Hour_1
-    if "DAY" in name:
+    if name.startswith("1-DAY-"):
         return _sdk_enum("Period", {}).Day
     raise ValueError(f"unsupported Longbridge bar period: {bar_type.spec}")
 
@@ -81,7 +82,7 @@ class LongbridgeDataClient(DataClient):
         self._lb_config = config
         self._context_factory = context_factory or LongbridgeContextFactory()
         self._quote: QuoteContext | None = None
-        self._queue: asyncio.Queue[tuple[str, str, Any]] | None = None
+        self._queue: asyncio.Queue[tuple[str, str, Any, int]] | None = None
         self._consumer: asyncio.Task[Any] | None = None
         self._health_task: asyncio.Task[Any] | None = None
         self._desired_quotes: set[str] = set()
@@ -90,6 +91,7 @@ class LongbridgeDataClient(DataClient):
         self._desired_depth: set[str] = set()
         self._last_quotes: dict[str, Any] = {}
         self._last_depth: dict[str, Any] = {}
+        self._depth_received_ns: dict[str, int] = {}
         self._deduplicator = TimedDeduplicator()
         self._quote_rate = SlidingWindowRateLimiter(10, 1.0)
         self._quote_concurrency = ConcurrencyLimiter(5)
@@ -101,6 +103,10 @@ class LongbridgeDataClient(DataClient):
     @property
     def quote_context(self) -> QuoteContext | None:
         return self._quote
+
+    @property
+    def connection_state(self) -> ConnectionState:
+        return self._connection_state
 
     async def _connect(self) -> None:
         self._connection_state = ConnectionState.CONNECTING
@@ -125,6 +131,8 @@ class LongbridgeDataClient(DataClient):
             await asyncio.gather(reconnect_task, return_exceptions=True)
         self._connection_state = ConnectionState.DISCONNECTED
         self._disconnect_started_ns = None
+        getattr(self, "_last_depth", {}).clear()
+        getattr(self, "_depth_received_ns", {}).clear()
         quote = self._quote
         if quote is not None:
             from longbridge.openapi import SubType
@@ -141,9 +149,7 @@ class LongbridgeDataClient(DataClient):
                         lambda: quote.unsubscribe(sorted(self._desired_trades), [SubType.Trade])
                     )
                 for symbol, period in self._desired_bars.items():
-                    await self._quote_call(
-                        partial(quote.unsubscribe_candlesticks, symbol, period)
-                    )
+                    await self._quote_call(partial(quote.unsubscribe_candlesticks, symbol, period))
             except Exception:
                 logger.debug("Longbridge quote unsubscribe during disconnect failed", exc_info=True)
             self._clear_quote_callbacks(quote)
@@ -163,10 +169,7 @@ class LongbridgeDataClient(DataClient):
     async def _health_loop(self) -> None:
         while True:
             await asyncio.sleep(max(5.0, self._lb_config.settings.reconnect_initial_secs))
-            if (
-                self._connection_state is ConnectionState.CONNECTED
-                and self._quote is not None
-            ):
+            if self._connection_state is ConnectionState.CONNECTED and self._quote is not None:
                 try:
                     await self._quote_call(self._quote.subscriptions)
                 except asyncio.CancelledError:
@@ -189,6 +192,9 @@ class LongbridgeDataClient(DataClient):
         if existing is not None and not existing.done():
             return existing
         self._connection_state = ConnectionState.RECONNECTING
+        self._depth_epoch_ns = self.clock.timestamp_ns()
+        getattr(self, "_last_depth", {}).clear()
+        getattr(self, "_depth_received_ns", {}).clear()
         task = asyncio.create_task(self._reconnect_loop(), name="longbridge-quote-reconnect")
         self._reconnect_task = task
 
@@ -268,6 +274,7 @@ class LongbridgeDataClient(DataClient):
             return
         for symbol in sorted(self._desired_trades):
             try:
+
                 async def fetch_trades(symbol: str = symbol) -> list[Any]:
                     return await quote.trades(symbol, 1000)
 
@@ -333,7 +340,7 @@ class LongbridgeDataClient(DataClient):
         if self._queue is None:
             return
         try:
-            self._queue.put_nowait((kind, symbol, event))
+            self._queue.put_nowait((kind, symbol, event, self.clock.timestamp_ns()))
         except asyncio.QueueFull:
             logger.warning(
                 "Longbridge market-data queue is full; dropping %s event for %s", kind, symbol
@@ -354,12 +361,12 @@ class LongbridgeDataClient(DataClient):
     async def _consume(self) -> None:
         assert self._queue is not None
         while True:
-            kind, symbol, event = await self._queue.get()
+            kind, symbol, event, received_ns = await self._queue.get()
             try:
                 if kind == "quote":
                     await self._publish_quote(symbol, event)
                 elif kind == "depth":
-                    await self._publish_depth(symbol, event)
+                    await self._publish_depth(symbol, event, received_ns=received_ns)
                 elif kind == "trades":
                     await self._publish_trades(symbol, event)
                 elif kind == "bar":
@@ -411,8 +418,17 @@ class LongbridgeDataClient(DataClient):
         ask = depth.asks[0]
         if getattr(bid, "price", None) is None or getattr(ask, "price", None) is None:
             return None
-        ts_event = timestamp_ns(getattr(event, "timestamp", None), self.clock.timestamp_ns())
-        key = f"quote:{symbol}:{ts_event}:{bid.price}:{ask.price}:{getattr(event, 'last_done', '')}"
+        if not all(math.isfinite(float(v)) and float(v) > 0 for v in (bid.price, ask.price, bid.volume, ask.volume)) or float(bid.price) > float(ask.price):
+            return None
+        # Depth is the source of BBO. Quote.last_done must never refresh an
+        # old depth snapshot's timestamp. SDK PushDepth has no exchange stamp,
+        # so its local receipt time is an explicitly approximate event time.
+        ts_event = getattr(self, "_depth_received_ns", {}).get(symbol)
+        if ts_event is None:
+            return None
+        if not 0 <= self.clock.timestamp_ns() - ts_event <= self._lb_config.max_depth_age_secs * 1e9:
+            return None
+        key = f"quote:{symbol}:{ts_event}:{bid.price}:{ask.price}:{bid.volume}:{ask.volume}"
         if not self._dedup(key):
             return None
         return QuoteTick(
@@ -425,8 +441,17 @@ class LongbridgeDataClient(DataClient):
             self.clock.timestamp_ns(),
         )
 
-    async def _publish_depth(self, symbol: str, event: Any) -> None:
+    async def _publish_depth(
+        self, symbol: str, event: Any, *, received_ns: int | None = None
+    ) -> None:
+        if received_ns is not None and received_ns < getattr(self, "_depth_epoch_ns", 0):
+            return
         self._last_depth[symbol] = event
+        if not hasattr(self, "_depth_received_ns"):
+            self._depth_received_ns = {}
+        self._depth_received_ns[symbol] = (
+            self.clock.timestamp_ns() if received_ns is None else received_ns
+        )
         ts_event = timestamp_ns(getattr(event, "timestamp", None), self.clock.timestamp_ns())
         instrument_id = await self._ensure_instrument(symbol)
         bids = [
@@ -470,6 +495,12 @@ class LongbridgeDataClient(DataClient):
                 self.clock.timestamp_ns(),
             )
         )
+        if symbol in getattr(self, "_desired_quotes", set()) or symbol in self._last_quotes:
+            tick = self._make_quote_tick(
+                instrument_id, symbol, self._last_quotes.get(symbol), event
+            )
+            if tick is not None:
+                self._handle_data(tick)
 
     async def _publish_trades(self, symbol: str, event: Any) -> None:
         instrument_id = await self._ensure_instrument(symbol)
@@ -496,6 +527,8 @@ class LongbridgeDataClient(DataClient):
             )
 
     async def _publish_bar(self, symbol: str, event: Any) -> None:
+        if self._lb_config.completed_bars_only and not getattr(event, "is_confirmed", False):
+            return
         candle = getattr(event, "candlestick", event)
         period_name = str(getattr(getattr(event, "period", None), "name", "Min_1"))
         instrument_id = await self._ensure_instrument(symbol)
@@ -602,6 +635,9 @@ class LongbridgeDataClient(DataClient):
             self._last_quotes[symbol] = value
             depth = await self._quote_call(lambda: quote.depth(symbol))
             self._last_depth[symbol] = depth
+            if not hasattr(self, "_depth_received_ns"):
+                self._depth_received_ns = {}
+            self._depth_received_ns[symbol] = self.clock.timestamp_ns()
             tick = self._make_quote_tick(request.instrument_id, symbol, value, depth)
             if tick is not None:
                 data.append(tick)

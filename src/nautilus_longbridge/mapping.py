@@ -10,8 +10,10 @@ from nautilus_trader.model import AggressorSide, Price, Quantity
 def timestamp_ns(value: datetime | None, fallback: int) -> int:
     if value is None:
         return fallback
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
+    # SDK PyOffsetDateTimeWrapper uses datetime.fromtimestamp(..., None),
+    # which returns OS-local naive time. astimezone uses that local timezone
+    # for naive values and preserves the instant for aware values.
+    # https://github.com/longbridge/openapi/blob/main/python/src/time.rs
     return int(value.astimezone(UTC).timestamp() * 1_000_000_000)
 
 

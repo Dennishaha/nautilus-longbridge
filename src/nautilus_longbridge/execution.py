@@ -25,6 +25,7 @@ from nautilus_trader.model import (
     Currency,
     FillReport,
     LiquiditySide,
+    MarginBalance,
     Money,
     OmsType,
     OrderSide,
@@ -39,6 +40,7 @@ from nautilus_trader.model import (
     VenueOrderId,
 )
 
+from .accounts import paper_margin_balance
 from .config import LongbridgeExecutionClientConfig, assert_order_enabled
 from .constants import TRADE_MARKETS
 from .errors import ConfigurationError, UnsupportedOperation
@@ -177,6 +179,10 @@ class LongbridgeExecutionClient(ExecutionClient):
         self._reconnect_lock = asyncio.Lock()
         self._reconnect_task: asyncio.Task[Any] | None = None
         self._connection_state = ConnectionState.DISCONNECTED
+        self._margin_submit_lock = asyncio.Lock()
+        self._margin_exit_lock = asyncio.Lock()
+        self._margin_preparing: set[str] = set()
+        self._margin_cancelled: set[str] = set()
         instrument_provider = kwargs.pop("instrument_provider", None)
         if instrument_provider is None:
             instrument_provider = LongbridgeInstrumentProvider()
@@ -184,12 +190,16 @@ class LongbridgeExecutionClient(ExecutionClient):
             config=config,
             venue=Venue("LONGBRIDGE"),
             account_id=AccountId(config.account_id),
-            account_type=AccountType.CASH,
+            account_type=AccountType.MARGIN if config.account_mode == "MARGIN" else AccountType.CASH,
             oms_type=OmsType.NETTING,
             base_currency=Currency.from_str(config.base_currency),
             instrument_provider=instrument_provider,
             **kwargs,
         )
+
+    @property
+    def connection_state(self) -> ConnectionState:
+        return self._connection_state
 
     async def _connect(self) -> None:
         self._connection_state = ConnectionState.CONNECTING
@@ -299,9 +309,7 @@ class LongbridgeExecutionClient(ExecutionClient):
         trade = self._trade
         if trade is not None:
             try:
-                await self._trade_call(
-                    lambda: trade.unsubscribe([_sdk_class("TopicType").Private])
-                )
+                await self._trade_call(lambda: trade.unsubscribe([_sdk_class("TopicType").Private]))
             except Exception:
                 logger.debug("Longbridge trade unsubscribe during disconnect failed", exc_info=True)
             try:
@@ -321,7 +329,9 @@ class LongbridgeExecutionClient(ExecutionClient):
                 try:
                     setter(lambda *args: None)
                 except Exception:
-                    logger.debug("Longbridge execution quote callback cleanup failed", exc_info=True)
+                    logger.debug(
+                        "Longbridge execution quote callback cleanup failed", exc_info=True
+                    )
         self._quote = None
         tasks = [task for task in (self._consumer, self._health_task) if task is not None]
         for task in tasks:
@@ -378,6 +388,13 @@ class LongbridgeExecutionClient(ExecutionClient):
         ):
             return
         status_changed = previous != status
+        # Report executions before a terminal cancellation/rejection, so a
+        # partially filled order cannot disappear before its fills arrive.
+        if filled > self._last_filled[client_order_id]:
+            await self._emit_fills_for_order(venue_order_id, order)
+            if self._last_filled[client_order_id] < filled:
+                logger.warning("Longbridge executions lag order status; deferring terminal event")
+                return
         self._last_status[client_order_id] = status
         if status == OrderStatus.ACCEPTED and status_changed:
             self.generate_order_accepted(order, venue_id, ts_event)
@@ -387,11 +404,243 @@ class LongbridgeExecutionClient(ExecutionClient):
             self.generate_order_rejected(order, "Longbridge rejected the order", ts_event, False)
         elif status == OrderStatus.EXPIRED and status_changed:
             self.generate_order_expired(order, venue_id, ts_event)
-        if filled > self._last_filled[client_order_id]:
-            self._last_filled[client_order_id] = filled
-            await self._emit_fills_for_order(venue_order_id, order)
+
+    async def paper_snapshot(self) -> dict[str, Any]:
+        """Read collateral, cash and positions without enabling short selling.
+
+        Returns only non-secret risk inputs. This is intentionally unavailable
+        for real-account clients; it is used by the ORB paper supervisor.
+        """
+        if not self._lb_config.settings.paper_trading or self._trade is None:
+            raise ConfigurationError("paper_snapshot requires a connected paper client")
+        started_ns = self.clock.timestamp_ns()
+        trade = self._trade
+        orders = await self._trade_call(trade.today_orders)
+        for value in orders:
+            await self._process_order_event(value)
+        balances = await self._trade_call(lambda: trade.account_balance(currency="USD"))
+        usd = [value for value in balances if str(getattr(value, "currency", "")).upper() == "USD"]
+        if len(usd) != 1:
+            raise ConfigurationError("paper risk requires one USD account balance")
+        balance = usd[0]
+        margin = (
+            paper_margin_balance(balance) if self._lb_config.account_mode == "MARGIN" else None
+        )
+        # Do not treat net_assets as spendable cash or silently invent cash
+        # availability when a field is not supplied by the broker.
+        cash_infos = getattr(balance, "cash_infos", [])
+        cash_info = next(
+            (v for v in cash_infos if str(getattr(v, "currency", "")).upper() == "USD"), None
+        )
+        available = getattr(balance, "available_cash", None)
+        if available is None and cash_info is not None:
+            available = getattr(cash_info, "available_cash", None)
+        if available is None:
+            available = getattr(balance, "cash_available", None)
+        if available is None and margin is None:
+            raise ConfigurationError("broker did not supply available USD cash")
+        response = await self._trade_call(trade.stock_positions)
+        channels = getattr(response, "channels", None)
+        values = (
+            [p for channel in channels for p in channel.positions]
+            if channels is not None
+            else getattr(response, "positions", response)
+        )
+        positions: dict[str, float] = {}
+        for value in values:
+            positions[str(value.symbol)] = positions.get(str(value.symbol), 0.0) + float(
+                value.quantity
+            )
+        open_orders = []
+        open_order_details = []
+        unmanaged = []
+        fees = getattr(self, "_paper_order_fees", {})
+        self._paper_order_fees = fees
+        for value in orders:
+            qty = as_decimal(getattr(value, "submitted_quantity", getattr(value, "quantity", 0)))
+            filled = as_decimal(getattr(value, "executed_quantity", 0))
+            if map_status(value.status, filled, qty) not in _TERMINAL_STATUSES:
+                open_orders.append(str(value.order_id))
+                open_order_details.append({
+                    "order_id": str(value.order_id), "symbol": str(value.symbol),
+                    "side": enum_name(value.side), "remaining": str(qty - filled),
+                    "price": str(getattr(value, "price", "0") or "0"),
+                })
+                if not self._client_id_for_venue(str(value.order_id)):
+                    unmanaged.append(str(value.order_id))
+            elif filled > 0 and (client_id := self._client_id_for_venue(str(value.order_id))):
+                if client_id not in fees and hasattr(trade, "order_detail"):
+                    detail = await self._trade_call(partial(trade.order_detail, str(value.order_id)))
+                    charges = getattr(detail, "charge_detail", None)
+                    if charges is not None and str(charges.currency).upper() == "USD":
+                        amount = as_decimal(charges.total_amount)
+                        if amount.is_finite() and amount >= 0:
+                            fees[client_id] = float(amount)
+        equity = as_decimal(balance.net_assets)
+        cash = as_decimal(available) if available is not None else None
+        if not equity.is_finite() or equity <= 0 or (
+            margin is None and (cash is None or not cash.is_finite() or cash < 0)
+        ):
+            raise ConfigurationError("invalid paper account balance")
+        if margin is not None:
+            self._publish_margin_state(balance, margin)
+        return {
+            **(margin or {"account_mode": "CASH", "account_healthy": True}),
+            "equity": float(balance.net_assets),
+            "available_cash": float(available) if available is not None else None,
+            "positions": positions,
+            "open_orders": open_orders,
+            "open_order_details": open_order_details,
+            "can_short": False,
+            "unmanaged_open_orders": unmanaged,
+            "order_fees": dict(fees),
+            "timestamp_ns": started_ns,
+        }
+
+    async def paper_buy_capacity(
+        self, symbol: str, order_type: Any, limit_price: Decimal | None = None
+    ) -> dict[str, Any]:
+        """Read the broker's symbol/order-specific ceiling, never place an order."""
+        if not self._lb_config.settings.paper_trading or self._trade is None:
+            raise ConfigurationError("buy capacity requires a connected paper client")
+        if not symbol.endswith(".US"):
+            raise UnsupportedOperation("paper margin currently supports US equities only")
+        trade = self._trade
+        response = await self._trade_call(lambda: trade.estimate_max_purchase_quantity(
+            symbol=symbol, order_type=order_type, side=_sdk_class("OrderSide").Buy,
+            price=limit_price, currency="USD", fractional_shares=False,
+        ))
+        result: dict[str, Any] = {"symbol": symbol, "timestamp_ns": self.clock.timestamp_ns()}
+        for name in ("cash_max_qty", "margin_max_qty"):
+            raw = getattr(response, name, None)
+            if raw is None or str(raw) == "":
+                raise ConfigurationError("broker did not supply purchase capacity")
+            value = as_decimal(raw)
+            if not value.is_finite() or value < 0 or value != value.to_integral_value():
+                raise ConfigurationError("invalid broker purchase capacity")
+            result[name] = int(value)
+        return result
+
+    async def _margin_preflight(self, order: Any, symbol: str, order_type: Any) -> None:
+        if not symbol.endswith(".US"):
+            raise UnsupportedOperation("paper margin currently supports US equities only")
+        snapshot = await self.paper_snapshot()
+        if enum_name(order.side).endswith("SELL"):
+            reserved = Decimal(0)
+            seen = set()
+            for pending in snapshot["open_order_details"]:
+                seen.add(pending["order_id"])
+                if pending["symbol"] == symbol and pending["side"].endswith("SELL"):
+                    reserved += as_decimal(pending["remaining"])
+            for key, pending in self._pending_orders.items():
+                if (
+                    symbol_from_instrument_id(pending.instrument_id) == symbol
+                    and enum_name(pending.side).endswith("SELL")
+                    and self._venue_by_client.get(key) not in seen
+                    and self._last_status.get(key) not in _TERMINAL_STATUSES
+                ):
+                    reserved += pending.quantity.as_decimal() - self._last_filled.get(key, Decimal(0))
+            if order.quantity.as_decimal() > as_decimal(snapshot["positions"].get(symbol, 0)) - reserved:
+                raise ConfigurationError("paper margin sell may only reduce an existing long")
+            return
+        if not snapshot["account_healthy"] or snapshot["buying_power"] <= 0:
+            raise ConfigurationError("broker margin risk or buying power blocks new entries")
+        capacity = await self.paper_buy_capacity(
+            symbol, order_type,
+            order.price.as_decimal() if getattr(order, "price", None) is not None else None,
+        )
+        if order.quantity.as_decimal() > capacity["margin_max_qty"]:
+            raise ConfigurationError("order exceeds broker margin purchase capacity")
+        if not 0 <= self.clock.timestamp_ns() - snapshot["timestamp_ns"] <= 20_000_000_000:
+            raise ConfigurationError("margin account snapshot expired during preflight")
+        tick = self._fresh_margin_quote(symbol)
+        # Recheck the 1x cap after the asynchronous broker queries. Include
+        # locally observed fills and pending entries while broker views lag.
+        owned = dict(snapshot["positions"])
+        local: dict[str, Decimal] = defaultdict(Decimal)
+        for key, pending in self._pending_orders.items():
+            name = symbol_from_instrument_id(pending.instrument_id)
+            sign = 1 if enum_name(pending.side).endswith("BUY") else -1
+            local[name] += sign * self._last_filled.get(key, Decimal(0))
+        for name, qty in local.items():
+            owned[name] = max(as_decimal(owned.get(name, 0)), qty)
+        if any(as_decimal(qty) < 0 for qty in owned.values()):
+            raise ConfigurationError("unexpected short position requires reconciliation")
+        gross = Decimal(0)
+        slots = set()
+        for name, qty in owned.items():
+            if qty:
+                if not name.endswith(".US"):
+                    raise ConfigurationError("non-US collateral positions require reconciliation")
+                slots.add(name)
+                gross += as_decimal(qty) * self._fresh_margin_quote(name).ask_price.as_decimal()
+        seen = set()
+        for pending in snapshot["open_order_details"]:
+            seen.add(pending["order_id"])
+            if pending["side"].endswith("BUY"):
+                name = pending["symbol"]
+                slots.add(name)
+                ask = self._fresh_margin_quote(name).ask_price.as_decimal()
+                gross += as_decimal(pending["remaining"]) * max(ask, as_decimal(pending["price"]))
+        for key, pending in self._pending_orders.items():
+            if (
+                self._venue_by_client.get(key) in seen
+                or self._last_status.get(key) in _TERMINAL_STATUSES
+                or not enum_name(pending.side).endswith("BUY")
+            ):
+                continue
+            name = symbol_from_instrument_id(pending.instrument_id)
+            remaining = pending.quantity.as_decimal() - self._last_filled.get(key, Decimal(0))
+            if remaining > 0:
+                slots.add(name)
+                gross += remaining * self._fresh_margin_quote(name).ask_price.as_decimal()
+        slots.add(symbol)
+        needed = order.quantity.as_decimal() * tick.ask_price.as_decimal() * Decimal("1.001") + 1
+        if len(slots) > 3 or gross + needed > as_decimal(snapshot["equity"]):
+            raise ConfigurationError("paper margin entry exceeds 3 positions or 1x equity exposure")
+        if needed > as_decimal(snapshot["buying_power"]):
+            raise ConfigurationError("paper margin entry exceeds current broker buying power")
+        self._last_margin_preflight = {
+            "symbol": symbol, "quantity": str(order.quantity),
+            "capacity": capacity, "gross_before": str(gross), "entry_budget": str(needed),
+            "equity": snapshot["equity"], "timestamp_ns": self.clock.timestamp_ns(),
+        }
+
+    def _fresh_margin_quote(self, symbol: str) -> Any:
+        tick = self.cache.quote(instrument_id_from_symbol(symbol))
+        if tick is None:
+            raise ConfigurationError("margin entry requires a complete fresh quote")
+        now = self.clock.timestamp_ns()
+        ages = [(now - stamp) / 1_000_000_000 for stamp in (tick.ts_event, tick.ts_init)]
+        if (
+            any(age < 0 or age > self._lb_config.max_quote_age_secs for age in ages)
+            or tick.bid_price.as_decimal() <= 0
+            or tick.ask_price.as_decimal() < tick.bid_price.as_decimal()
+            or tick.bid_size.as_decimal() <= 0 or tick.ask_size.as_decimal() <= 0
+        ):
+            raise ConfigurationError("margin entry quote is stale or incomplete after preflight")
+        return tick
 
     async def _submit_order(self, command: Any) -> None:
+        if self._lb_config.account_mode != "MARGIN":
+            await self._submit_order_inner(command)
+            return
+        key = str(command.order.client_order_id)
+        self._margin_preparing.add(key)
+        try:
+            # Serialize entries; protective SELL orders need not wait for this lock.
+            if enum_name(command.order.side).endswith("BUY"):
+                async with self._margin_submit_lock:
+                    await self._submit_order_inner(command)
+            else:
+                async with self._margin_exit_lock:
+                    await self._submit_order_inner(command)
+        finally:
+            self._margin_preparing.discard(key)
+            if key in self._venue_by_client or key not in self._pending_orders:
+                self._margin_cancelled.discard(key)
+
+    async def _submit_order_inner(self, command: Any) -> None:
         order = command.order
         try:
             assert_order_enabled(self._lb_config.settings)
@@ -415,6 +664,10 @@ class LongbridgeExecutionClient(ExecutionClient):
             )
             if getattr(order, "is_post_only", False) or getattr(order, "is_reduce_only", False):
                 raise UnsupportedOperation("post-only and reduce-only are not supported")
+            if self._lb_config.account_mode == "MARGIN":
+                await self._margin_preflight(order, symbol, order_type)
+                if str(order.client_order_id) in self._margin_cancelled:
+                    raise ConfigurationError("entry canceled during margin preflight")
         except Exception as exc:
             self.generate_order_denied(order, str(exc))
             return
@@ -423,8 +676,18 @@ class LongbridgeExecutionClient(ExecutionClient):
         try:
             trade = self._trade
             assert trade is not None
-            response = await self._trade_call(
-                lambda: trade.submit_order(
+            def submit() -> Awaitable[Any]:
+                # The rate limiter can wait after preflight. Recheck at the
+                # actual transport boundary, before any SDK submission starts.
+                if self._lb_config.account_mode == "MARGIN":
+                    if str(order.client_order_id) in self._margin_cancelled:
+                        raise ConfigurationError("order canceled before transport submission")
+                    if enum_name(order.side).endswith("BUY"):
+                        self._fresh_margin_quote(symbol)
+                        checked = self._last_margin_preflight["timestamp_ns"]
+                        if self.clock.timestamp_ns() - checked > 20_000_000_000:
+                            raise ConfigurationError("margin preflight expired before submission")
+                return trade.submit_order(
                     symbol=symbol,
                     order_type=order_type,
                     side=side,
@@ -438,7 +701,7 @@ class LongbridgeExecutionClient(ExecutionClient):
                     client_request_id=client_request_id(order.client_order_id),
                     remark=client_request_id(order.client_order_id),
                 )
-            )
+            response = await self._trade_call(submit)
         except TimeoutError:
             logger.error(
                 "Longbridge submit timed out for %s; keeping order submitted and reconciling",
@@ -461,6 +724,8 @@ class LongbridgeExecutionClient(ExecutionClient):
         self._venue_by_client[str(order.client_order_id)] = venue_id
         self._last_status[str(order.client_order_id)] = OrderStatus.ACCEPTED
         self.generate_order_accepted(order, VenueOrderId(venue_id), self.clock.timestamp_ns())
+        if str(order.client_order_id) in getattr(self, "_margin_cancelled", set()):
+            await self._cancel_order(command)
 
     async def _load_instrument(self, instrument_id: Any, symbol: str) -> Any:
         provider = self.instrument_provider
@@ -490,9 +755,7 @@ class LongbridgeExecutionClient(ExecutionClient):
         else:
             task = asyncio.create_task(coroutine, name=f"reconcile-{client_order_id}")
         self._reconciliation_tasks[client_order_id] = task
-        task.add_done_callback(
-            lambda _: self._reconciliation_tasks.pop(client_order_id, None)
-        )
+        task.add_done_callback(lambda _: self._reconciliation_tasks.pop(client_order_id, None))
 
     async def _reconcile_uncertain_order(
         self, client_order_id: str, *, max_attempts: int = 5
@@ -514,6 +777,12 @@ class LongbridgeExecutionClient(ExecutionClient):
                     venue_id = str(matches[0].order_id)
                     self._venue_by_client[client_order_id] = venue_id
                     await self._process_order_event(matches[0])
+                    if client_order_id in getattr(self, "_margin_cancelled", set()):
+                        if self._last_status.get(client_order_id) not in _TERMINAL_STATUSES:
+                            from types import SimpleNamespace
+
+                            await self._cancel_order(SimpleNamespace(order=order))
+                        self._margin_cancelled.discard(client_order_id)
                     logger.info(
                         "Reconciled uncertain Longbridge order %s as venue order %s",
                         client_order_id,
@@ -558,6 +827,13 @@ class LongbridgeExecutionClient(ExecutionClient):
     async def _modify_order(self, command: Any) -> None:
         order = command.order
         venue_id = self._venue_by_client.get(str(order.client_order_id))
+        if self._lb_config.account_mode == "MARGIN":
+            self.generate_order_modify_rejected(
+                order, VenueOrderId(venue_id) if venue_id else None,
+                "paper margin amendments require cancel and a newly checked order",
+                self.clock.timestamp_ns(),
+            )
+            return
         if not venue_id or self._trade is None:
             self.generate_order_modify_rejected(
                 order,
@@ -591,6 +867,16 @@ class LongbridgeExecutionClient(ExecutionClient):
 
     async def _cancel_order(self, command: Any) -> None:
         order = command.order
+        key = str(order.client_order_id)
+        if (
+            self._lb_config.account_mode == "MARGIN"
+            and key not in self._venue_by_client
+            and (key in self._margin_preparing or key in self._pending_orders)
+        ):
+            self._margin_cancelled.add(key)
+            if key not in self._margin_preparing:
+                self._schedule_reconciliation(key)
+            return
         venue_id = self._venue_by_client.get(str(order.client_order_id))
         if not venue_id or self._trade is None:
             self.generate_order_cancel_rejected(
@@ -632,29 +918,72 @@ class LongbridgeExecutionClient(ExecutionClient):
     async def _emit_account_state(self) -> None:
         if self._trade is None:
             return
+        trade = self._trade
         try:
-            values = await self._trade_call(self._trade.account_balance)
+            values = await self._trade_call(
+                (lambda: trade.account_balance(currency="USD"))
+                if self._lb_config.account_mode == "MARGIN" else trade.account_balance
+            )
         except Exception as exc:
             logger.warning("Longbridge account balance unavailable: %s", type(exc).__name__)
+            return
+        if self._lb_config.account_mode == "MARGIN":
+            if len(values) != 1:
+                raise ConfigurationError("margin account requires one USD valuation")
+            self._publish_margin_state(values[0], paper_margin_balance(values[0]))
             return
         balances: list[AccountBalance] = []
         for value in values:
             currency = Currency.from_str(
                 str(getattr(value, "currency", self._lb_config.base_currency)).upper()
             )
-            total = as_decimal(getattr(value, "net_assets", getattr(value, "total_cash", 0)))
-            free = as_decimal(
-                getattr(value, "available_cash", getattr(value, "cash_available", total))
-            )
-            balances.append(
-                AccountBalance(
-                    Money.from_decimal(total, currency),
-                    Money.from_decimal(total - free, currency),
-                    Money.from_decimal(free, currency),
+            infos = getattr(value, "cash_infos", [])
+            if infos:
+                for info in infos:
+                    cash_currency = Currency.from_str(str(info.currency).upper())
+                    free = as_decimal(info.available_cash)
+                    locked = as_decimal(getattr(info, "frozen_cash", 0)) + as_decimal(
+                        getattr(info, "settling_cash", 0)
+                    )
+                    if free.is_finite() and locked.is_finite() and free >= 0 and locked >= 0:
+                        balances.append(
+                            AccountBalance(
+                                Money.from_decimal(free + locked, cash_currency),
+                                Money.from_decimal(locked, cash_currency),
+                                Money.from_decimal(free, cash_currency),
+                            )
+                        )
+            else:
+                total = as_decimal(getattr(value, "total_cash", 0))
+                free = as_decimal(
+                    getattr(value, "available_cash", getattr(value, "cash_available", 0))
                 )
-            )
+                if total.is_finite() and free.is_finite() and 0 <= free <= total:
+                    balances.append(
+                        AccountBalance(
+                            Money.from_decimal(total, currency),
+                            Money.from_decimal(total - free, currency),
+                            Money.from_decimal(free, currency),
+                        )
+                    )
         if balances:
             self.generate_account_state(balances, [], True, self.clock.timestamp_ns())
+
+    def _publish_margin_state(self, balance: Any, info: dict[str, Any]) -> None:
+        # USD is broker-valued collateral equity, not a fabricated USD cash balance.
+        usd = Currency.from_str("USD")
+        equity = as_decimal(balance.net_assets)
+        initial = as_decimal(balance.init_margin)
+        maintenance = as_decimal(balance.maintenance_margin)
+        self.generate_account_state(
+            [AccountBalance(
+                Money.from_decimal(equity, usd), Money.from_decimal(initial, usd),
+                Money.from_decimal(equity - initial, usd),
+            )],
+            [MarginBalance(Money.from_decimal(initial, usd), Money.from_decimal(maintenance, usd))],
+            True, self.clock.timestamp_ns(),
+            {**info, "balance_semantics": "BROKER_VALUED_COLLATERAL_EQUITY"},
+        )
 
     async def _emit_fills_for_order(self, venue_order_id: str, order: Any) -> None:
         if self._trade is None:
@@ -666,7 +995,6 @@ class LongbridgeExecutionClient(ExecutionClient):
             execution_id = self._execution_id(value)
             if not execution_id or execution_id in self._seen_fills:
                 continue
-            self._seen_fills.add(execution_id)
             fill = self._fill_report(value, ClientOrderId(str(order.client_order_id)))
             self._handle_report(fill)
             self.generate_order_filled(
@@ -680,6 +1008,13 @@ class LongbridgeExecutionClient(ExecutionClient):
                 fill.commission,
                 fill.liquidity_side,
                 fill.ts_event,
+            )
+            self._seen_fills.add(execution_id)
+            if not hasattr(self, "_last_filled"):
+                self._last_filled = defaultdict(Decimal)
+            key = str(order.client_order_id)
+            self._last_filled[key] = (
+                self._last_filled.get(key, Decimal(0)) + fill.last_qty.as_decimal()
             )
 
     def _execution_id(self, value: Any) -> str:
@@ -746,9 +1081,7 @@ class LongbridgeExecutionClient(ExecutionClient):
         trade = self._trade
         venue_order_id = getattr(command, "venue_order_id", None)
         values = await self._trade_call(
-            lambda: trade.today_executions(
-                order_id=str(venue_order_id) if venue_order_id else None
-            )
+            lambda: trade.today_executions(order_id=str(venue_order_id) if venue_order_id else None)
         )
         return [self._fill_report(value) for value in values]
 
@@ -808,15 +1141,11 @@ class LongbridgeExecutionClient(ExecutionClient):
             timestamp_ns(getattr(value, "submitted_at", None), self.clock.timestamp_ns()),
             timestamp_ns(getattr(value, "updated_at", None), self.clock.timestamp_ns()),
             self.clock.timestamp_ns(),
-            client_order_id=ClientOrderId(str(client_id))
-            if client_id
-            else None,
+            client_order_id=ClientOrderId(str(client_id)) if client_id else None,
             price=price(submitted_price, precision) if submitted_price is not None else None,
         )
 
-    def _fill_report(
-        self, value: Any, client_order_id: ClientOrderId | None = None
-    ) -> FillReport:
+    def _fill_report(self, value: Any, client_order_id: ClientOrderId | None = None) -> FillReport:
         symbol = str(getattr(value, "symbol", ""))
         instrument_id = instrument_id_from_symbol(symbol)
         precision = self._price_precision(instrument_id)

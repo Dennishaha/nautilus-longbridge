@@ -6,7 +6,7 @@
 - `nautilus_trader==2.0.0rc7`
 - `longbridge==5.2.2`
 
-当前连接器版本：`0.1.2`（测试版，不声明生产级稳定性）。
+当前连接器版本：`0.1.4`（测试版，不声明生产级稳定性）。
 
 ## 安装
 
@@ -148,3 +148,63 @@ rg -n --hidden -g '!*.pyc' -g '!.git/**' '(LONGBRIDGE_APP_SECRET|LONGBRIDGE_ACCE
 ## 兼容策略
 
 适配器以本机验证的 NautilusTrader `2.0.0rc7` 行为为准。升级到正式 v2 或其他 rc 版本时，先重新运行 Factory 注册 smoke、配置构造、typed response 和 report 构造测试，再调整依赖范围。
+
+## ORB execution support (0.1.3)
+
+`LongbridgeDataClientConfig(completed_bars_only=True, max_depth_age_secs=2)` can
+forward only confirmed candles and reject stale BBO. Depth callbacks now produce
+Quote ticks themselves. BBO timestamps use local depth receipt time (including
+queue delay), not the timestamp of an unrelated last-trade update. PushDepth does
+not provide certified exchange/NBBO timestamps. Unsupported aggregate bar periods
+are rejected instead of silently subscribing to 1-minute bars.
+
+Both clients expose `connection_state`. A connected paper execution client offers
+`await client.paper_snapshot()` with USD equity, actual available cash, aggregated
+positions, open/unmanaged orders and verified terminal-order fee details when
+available. It never infers short permission from the CASH account model. Account
+cash balances use `cash_infos`, rather than treating net assets as spendable cash.
+Missing available cash fails closed in the default CASH mode.
+
+### Paper cross-currency margin (0.1.4)
+
+`LongbridgeExecutionClientConfig(account_mode="MARGIN", paper_trading=True,
+base_currency="USD")` explicitly enables the paper margin account model. The
+default connector mode remains `CASH`. Real-account margin and non-USD valuation
+are rejected by this release.
+
+The broker's USD-valued net equity is published as margin collateral, with its
+reported initial/maintenance margins. `AccountState.info` retains separate
+per-currency cash details (including negative USD available cash), buying power,
+financing limits and risk level. A missing USD cash row stays `None`; it is never
+replaced with buying power. These cash deficits are not a separately verified
+loan principal or accrued-interest statement.
+
+Before each new US equity buy, the adapter requests the broker's order-specific
+`estimate_max_purchase_quantity` (including the market-order type), checks
+`margin_max_qty`, current account risk, complete fresh quotes, pending orders,
+local fills and a maximum of 3 positions / 1x net-equity exposure. Broker queries
+that fail or quotes that expire block entry. Market gaps can still move actual
+filled exposure beyond its pretrade estimate.
+
+Sales may only reduce an existing long, with outstanding exits reserved to avoid
+opening shorts. Protective sales have a separate submission lock and remain
+available when account risk blocks new buys. Cancellation during preflight or
+an uncertain submission is retained through acknowledgement/reconciliation;
+submission is never blindly retried. Margin amendments require cancel and a new
+checked order. This mode does not enable short selling or currency exchange.
+
+`await client.paper_buy_capacity("AAPL.US", OrderType.MO)` is a read-only capacity
+query. `paper_snapshot()` in margin mode additionally returns `account_mode`,
+`buying_power`, `currency_cash`, margin fields and `account_healthy`.
+
+Execution reports are emitted before partial-cancel terminal events. If the
+execution endpoint lags the order status, terminal delivery waits for a later
+reconciliation rather than discarding residual fills. SDK Execution has no normal
+commission field; consumers must reconcile order `charge_detail` and cannot treat
+missing fees as zero. These changes support the separate strategy-lab ORB paper
+supervisor; this connector still has no native stop-order implementation.
+
+SDK naive output datetimes are OS-local (`datetime.fromtimestamp(..., None)`),
+not UTC wall-clock values. Conversion now preserves that instant before converting
+to UTC nanoseconds; timezone-aware timestamps retain their own offset. See the
+[upstream conversion](https://github.com/longbridge/openapi/blob/main/python/src/time.rs).
