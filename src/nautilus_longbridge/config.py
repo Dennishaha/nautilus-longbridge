@@ -138,6 +138,8 @@ class LongbridgeDataClientConfig(_SafeConfigMixin, DataClientConfig):
         price_increment: str = "0.0001",
         completed_bars_only: bool = False,
         max_depth_age_secs: float = 2.0,
+        historical_adjustment: str = "NoAdjust",
+        historical_evidence_dir: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -181,6 +183,12 @@ class LongbridgeDataClientConfig(_SafeConfigMixin, DataClientConfig):
         self.price_increment = price_increment
         self.completed_bars_only = completed_bars_only
         self.max_depth_age_secs = max_depth_age_secs
+        if historical_adjustment not in {"NoAdjust", "ForwardAdjust"}:
+            raise ConfigurationError("unsupported historical adjustment")
+        if historical_evidence_dir is not None and not historical_evidence_dir.strip():
+            raise ConfigurationError("historical_evidence_dir must not be empty")
+        self.historical_adjustment = historical_adjustment
+        self.historical_evidence_dir = historical_evidence_dir
         if not math.isfinite(max_depth_age_secs) or max_depth_age_secs <= 0:
             raise ConfigurationError("max_depth_age_secs must be finite and positive")
         self.settings.validate()
@@ -194,6 +202,8 @@ class LongbridgeDataClientConfig(_SafeConfigMixin, DataClientConfig):
             "price_increment": self.price_increment,
             "completed_bars_only": completed_bars_only,
             "max_depth_age_secs": max_depth_age_secs,
+            "historical_adjustment": historical_adjustment,
+            "historical_evidence_dir": historical_evidence_dir,
         }
 
 

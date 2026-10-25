@@ -732,42 +732,84 @@ class LongbridgeDataClient(DataClient):
         symbol = symbol_from_instrument_id(request.bar_type.instrument_id)
         from longbridge.openapi import AdjustType, TradeSessions
 
+        from .evidence import HistoryEvidence
+
         period = _period_for_bar_type(request.bar_type)
-        values = await self._quote_call(
-            lambda: quote.candlesticks(
-                symbol,
-                period,
-                request.limit or 1000,
-                AdjustType.NoAdjust,
-                TradeSessions.Intraday,
-            )
-        )
-        data: list[Any] = []
-        for candle in values:
-            ts_event = timestamp_ns(getattr(candle, "timestamp", None), self.clock.timestamp_ns())
-            data.append(
-                Bar(
+        adjustment = getattr(self._lb_config, "historical_adjustment", "NoAdjust")
+        evidence = None
+        try:
+            if request.start_ns is not None or request.end_ns is not None:
+                from .history import history_candles
+
+                if request.start_ns is None:
+                    raise ValueError("bounded historical bars require a start timestamp")
+                directory = getattr(self._lb_config, "historical_evidence_dir", None)
+                if directory is not None:
+                    evidence = HistoryEvidence(
+                        directory, str(request.request_id), symbol, str(period), adjustment
+                    )
+                values = await history_candles(
+                    quote,
+                    symbol,
+                    period,
+                    getattr(AdjustType, adjustment),
+                    request.start_ns,
+                    request.end_ns if request.end_ns is not None else self.clock.timestamp_ns(),
+                    call=self._quote_call,
+                    evidence=evidence.capture if evidence else None,
+                )
+                if request.limit:
+                    values = values[-request.limit :]
+            else:
+                values = await self._quote_call(
+                    lambda: quote.candlesticks(
+                        symbol,
+                        period,
+                        request.limit or 1000,
+                        getattr(AdjustType, adjustment),
+                        TradeSessions.Intraday,
+                    )
+                )
+            await self._ensure_instrument(symbol)
+            data: list[Any] = []
+            for candle in values:
+                ts_event = timestamp_ns(
+                    getattr(candle, "timestamp", None), self.clock.timestamp_ns()
+                )
+                ts_init = evidence.received_ns[ts_event] if evidence else self.clock.timestamp_ns()
+                data.append(
+                    Bar(
+                        request.bar_type,
+                        price(candle.open, self._lb_config.price_precision),
+                        price(candle.high, self._lb_config.price_precision),
+                        price(candle.low, self._lb_config.price_precision),
+                        price(candle.close, self._lb_config.price_precision),
+                        quantity(candle.volume),
+                        ts_event,
+                        ts_init,
+                    )
+                )
+            self._handle_response(
+                BarsResponse(
+                    self.client_id,
                     request.bar_type,
-                    price(candle.open, self._lb_config.price_precision),
-                    price(candle.high, self._lb_config.price_precision),
-                    price(candle.low, self._lb_config.price_precision),
-                    price(candle.close, self._lb_config.price_precision),
-                    quantity(candle.volume),
-                    ts_event,
+                    data,
+                    request.request_id,
                     self.clock.timestamp_ns(),
+                    # The adapter has already filtered by ts_event. rc7's
+                    # response bounds trim by ts_init and would drop fetched
+                    # history whose real receipt time is later than the range.
+                    None,
+                    None,
                 )
             )
-        self._handle_response(
-            BarsResponse(
-                self.client_id,
-                request.bar_type,
-                data,
-                request.request_id,
-                self.clock.timestamp_ns(),
-                request.start_ns,
-                request.end_ns,
-            )
-        )
+        except BaseException as exc:
+            if evidence:
+                evidence.finish(exc)
+            raise
+        else:
+            if evidence:
+                evidence.finish()
 
     async def _request_book_snapshot(self, request: Any) -> None:
         quote = self._quote

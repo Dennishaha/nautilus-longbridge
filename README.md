@@ -80,6 +80,19 @@ node = builder.build()
 
 策略只使用 NautilusTrader 的标准订阅、历史数据请求和订单 API。策略层不会接触 Longbridge SDK context。
 
+## 有界历史行情请求
+
+策略通过 NT `request_bars` 提供起止时间时，连接器按供应商日期接口分页、限频，检查重复与 OHLCV，
+并按事件时间筛选；没有时间范围时保留近期行情接口。复用既有 context 工厂、端点配置和超时控制。
+`LongbridgeDataClientConfig` 可配置 `historical_adjustment="NoAdjust"`（或 `"ForwardAdjust"`）与
+`historical_evidence_dir`。启用证据目录后，每个请求按关联 ID 留存原始响应和 SHA-256，先记录再校验；
+失败保留证据与异常类别。`ts_init` 保留实际获取/标准化时间；不重写为历史收盘时间。
+
+连接器负责长桥协议适配及 NT 标准对象，不依赖研究工具包或策略。
+研究审计导入、候选区间选择、预热交易日规划、研究合约占位定义和快照发布由独立的
+`nt-data-tools` 项目负责，其 `nt-data fetch` 通过 NT 原生历史请求使用本连接器。
+原 `nt-longbridge-catalog` 入口已移除。连接器无需 `exchange-calendars` 或 ML 验收规则。
+
 ## K 线落盘：Parquet Data Catalog
 
 实时采集使用 NT rc7 的原生链路：`LongbridgeDataClient -> DataEngine -> StreamingConfig ->
