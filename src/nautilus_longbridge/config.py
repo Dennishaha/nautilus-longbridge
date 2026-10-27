@@ -72,6 +72,7 @@ class LongbridgeSafeSettings:
     reconnect_max_secs: float = 30.0
     reconnect_max_attempts: int = 5
     queue_size: int = 10_000
+    enable_overnight: bool = False
 
     def validate(self) -> None:
         if self.region not in {"cn", "hk"}:
@@ -139,7 +140,11 @@ class LongbridgeDataClientConfig(_SafeConfigMixin, DataClientConfig):
         completed_bars_only: bool = False,
         max_depth_age_secs: float = 2.0,
         historical_adjustment: str = "NoAdjust",
+        historical_trade_sessions: str = "Intraday",
+        enable_overnight: bool | None = None,
+        live_trade_sessions: str = "Intraday",
         historical_evidence_dir: str | None = None,
+        reference_account_enabled: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -178,6 +183,8 @@ class LongbridgeDataClientConfig(_SafeConfigMixin, DataClientConfig):
             queue_size=(
                 _env_int("LONGBRIDGE_QUEUE_SIZE", 10_000) if queue_size is None else queue_size
             ),
+            enable_overnight=_env_bool("LONGBRIDGE_ENABLE_OVERNIGHT", False)
+            if enable_overnight is None else enable_overnight,
         )
         self.price_precision = price_precision
         self.price_increment = price_increment
@@ -185,9 +192,16 @@ class LongbridgeDataClientConfig(_SafeConfigMixin, DataClientConfig):
         self.max_depth_age_secs = max_depth_age_secs
         if historical_adjustment not in {"NoAdjust", "ForwardAdjust"}:
             raise ConfigurationError("unsupported historical adjustment")
+        if historical_trade_sessions not in {"Intraday", "All"}:
+            raise ConfigurationError("unsupported historical trade sessions")
+        if live_trade_sessions not in {"Intraday", "All"}:
+            raise ConfigurationError("unsupported live trade sessions")
+        self.live_trade_sessions = live_trade_sessions
+        self.reference_account_enabled = reference_account_enabled
         if historical_evidence_dir is not None and not historical_evidence_dir.strip():
             raise ConfigurationError("historical_evidence_dir must not be empty")
         self.historical_adjustment = historical_adjustment
+        self.historical_trade_sessions = historical_trade_sessions
         self.historical_evidence_dir = historical_evidence_dir
         if not math.isfinite(max_depth_age_secs) or max_depth_age_secs <= 0:
             raise ConfigurationError("max_depth_age_secs must be finite and positive")
@@ -203,7 +217,11 @@ class LongbridgeDataClientConfig(_SafeConfigMixin, DataClientConfig):
             "completed_bars_only": completed_bars_only,
             "max_depth_age_secs": max_depth_age_secs,
             "historical_adjustment": historical_adjustment,
+            "historical_trade_sessions": historical_trade_sessions,
+            "enable_overnight": self.settings.enable_overnight,
+            "live_trade_sessions": live_trade_sessions,
             "historical_evidence_dir": historical_evidence_dir,
+            "reference_account_enabled": reference_account_enabled,
         }
 
 
@@ -343,6 +361,7 @@ def build_sdk_config(settings: LongbridgeSafeSettings) -> Any:
         quote_ws_url=settings.quote_ws_url or endpoint_defaults["quote_ws_url"],
         trade_ws_url=settings.trade_ws_url or endpoint_defaults["trade_ws_url"],
         enable_papertrading=settings.paper_trading,
+        enable_overnight=settings.enable_overnight,
     )
 
 

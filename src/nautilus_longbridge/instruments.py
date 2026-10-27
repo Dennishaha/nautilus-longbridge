@@ -60,11 +60,24 @@ class LongbridgeInstrumentProvider(InstrumentProvider):
             return
         if self._quote_context is None:
             raise RuntimeError("quote context is not connected")
-        infos = await self._quote_context.static_info(symbols)
+        requested = {str(symbol).strip().upper() for symbol in symbols}
+        infos = await self._quote_context.static_info(sorted(requested))
+        returned = [str(getattr(info, "symbol", "")).strip().upper() for info in infos]
+        if any(not symbol for symbol in returned):
+            raise ConfigurationError("Longbridge static_info returned an empty symbol")
+        if set(returned) - requested:
+            raise ConfigurationError("Longbridge static_info returned an unrequested symbol")
+        if len(returned) != len(set(returned)):
+            raise ConfigurationError("Longbridge static_info returned duplicate symbols")
+        missing = requested - set(returned)
+        if missing:
+            raise ConfigurationError(
+                f"Longbridge static_info returned no instrument for {sorted(missing)}"
+            )
         for info in infos:
             self.add(self._to_equity(info))
 
-    def _to_equity(self, info: Any) -> Equity:
+    def _to_equity(self, info: Any, *, reference: dict[str, Any] | None = None) -> Equity:
         raw_symbol = str(info.symbol).upper()
         market_for_symbol(raw_symbol)
         explicit_type = self._explicit_security_type(info)
@@ -85,15 +98,18 @@ class LongbridgeInstrumentProvider(InstrumentProvider):
             )
         instrument_id = instrument_id_from_symbol(raw_symbol)
         currency = Currency.from_str(str(info.currency).upper())
-        lot_size = int(getattr(info, "lot_size", 1) or 1)
+        raw_lot_size = getattr(info, "lot_size", None)
+        if raw_lot_size is None or int(raw_lot_size) <= 0:
+            raise ConfigurationError(f"Longbridge returned invalid lot size for {raw_symbol}")
+        lot_size = int(raw_lot_size)
         instrument = Equity(
             instrument_id=instrument_id,
             raw_symbol=Symbol(raw_symbol),
             currency=currency,
             price_precision=self.price_precision,
             price_increment=Price.from_decimal_dp(self.price_increment, self.price_precision),
-            ts_event=0,
-            ts_init=0,
+            ts_event=reference["received_ns"] if reference else 0,
+            ts_init=reference["received_ns"] if reference else 0,
             lot_size=Quantity.from_int(lot_size),
             info={
                 "name_cn": getattr(info, "name_cn", ""),
@@ -101,6 +117,8 @@ class LongbridgeInstrumentProvider(InstrumentProvider):
                 "name_hk": getattr(info, "name_hk", ""),
                 "exchange": getattr(info, "exchange", ""),
                 "longbridge_symbol": raw_symbol,
+                "price_increment_source": "connector_config_unverified",
+                **({"broker_reference": reference} if reference else {}),
             },
         )
         self.add_currency(currency)

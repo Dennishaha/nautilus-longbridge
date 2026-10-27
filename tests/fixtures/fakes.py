@@ -109,6 +109,19 @@ class FakeTradeContext:
             if str(getattr(execution, "order_id", "")) == order_id
         ]
 
+    async def history_orders(self, **kwargs: Any) -> list[Any]:
+        return self.orders
+
+    async def history_executions(self, **kwargs: Any) -> list[Any]:
+        return self.executions
+
+    async def all_executions(self, **kwargs: Any) -> Any:
+        return type(
+            "AllExecutionsResponse",
+            (),
+            {"trades": self.executions, "has_more": False},
+        )()
+
     async def submit_order(self, **kwargs: Any) -> Any:
         self.submitted.append(kwargs)
         if self.submit_exception is not None:

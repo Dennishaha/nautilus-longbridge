@@ -6,8 +6,10 @@ import logging
 import random
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from decimal import Decimal
 from functools import partial
+from types import SimpleNamespace
 from typing import Any
 
 from nautilus_trader.live import (
@@ -118,37 +120,73 @@ def map_time_in_force(tif: Any, expire_time: int | None = None) -> tuple[Any, An
 
 
 def map_status(status: Any, filled_qty: Decimal, quantity_value: Decimal) -> OrderStatus:
-    name = enum_name(status)
-    if "REJECT" in name or "FAIL" in name:
+    if status is None:
+        return OrderStatus.SUBMITTED
+    name = enum_name(status).replace("_", "")
+    if name in {"REJECTED", "FAILED", "SUBMITFAILED"}:
         return OrderStatus.REJECTED
-    if "EXPIRE" in name:
+    if name == "EXPIRED":
         return OrderStatus.EXPIRED
-    if "CANCEL" in name or "WITHDRAW" in name:
+    if name in {"CANCELED", "CANCELLED"}:
         return OrderStatus.CANCELED
-    if "FILL" in name:
+    if name in {"FILLED", "PARTIALFILLED"}:
         return OrderStatus.FILLED if filled_qty >= quantity_value else OrderStatus.PARTIALLY_FILLED
+    if name == "PARTIALWITHDRAWAL":
+        return OrderStatus.CANCELED
     if filled_qty > 0:
         return OrderStatus.PARTIALLY_FILLED
-    if "NEW" in name or "ACCEPT" in name or "SUBMIT" in name or "REPORT" in name:
+    if name in {
+        "NEW",
+        "WAITTONEW",
+        "PENDINGCANCEL",
+        "WAITTOCANCEL",
+        "PENDINGREPLACE",
+        "WAITTOREPLACE",
+        "REPLACED",
+    }:
         return OrderStatus.ACCEPTED
-    return OrderStatus.SUBMITTED
+    if name in {
+        "NOTREPORTED",
+        "DELAYEDNOTREPORTED",
+        "PROTECTEDNOTREPORTED",
+        "VARIETIESNOTREPORTED",
+        "REPLACEDNOTREPORTED",
+    }:
+        return OrderStatus.SUBMITTED
+    raise UnsupportedOperation(f"unsupported Longbridge order status {name}")
 
 
 def map_order_type_report(order_type: Any) -> OrderType:
-    return (
-        OrderType.MARKET
-        if "MO" in enum_name(order_type) or "MARKET" in enum_name(order_type)
-        else OrderType.LIMIT
-    )
+    name = enum_name(order_type).replace("_", "")
+    if name in {"MO", "MARKET"}:
+        return OrderType.MARKET
+    if name in {"LO", "LIMIT"}:
+        return OrderType.LIMIT
+    raise UnsupportedOperation(f"unsupported Longbridge report order type {name}")
 
 
 def map_tif_report(value: Any) -> TimeInForce:
-    name = enum_name(value)
-    if "CANCEL" in name or "GTC" in name:
+    name = enum_name(value).replace("_", "")
+    if name in {"GTC", "GOODTILCANCELED", "GOODTILCANCELLED"}:
         return TimeInForce.GTC
-    if "DATE" in name or "GTD" in name:
+    if name in {"GTD", "GOODTILDATE"}:
         return TimeInForce.GTD
-    return TimeInForce.DAY
+    if name in {"DAY", "NONE"}:
+        return TimeInForce.DAY
+    raise UnsupportedOperation(f"unsupported Longbridge report time in force {name}")
+
+
+def _command_ns(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return timestamp_ns(value, 0)
+    return int(value)
+
+
+def _command_datetime(value: Any) -> datetime | None:
+    stamp = _command_ns(value)
+    return datetime.fromtimestamp(stamp / 1_000_000_000, UTC) if stamp is not None else None
 
 
 class LongbridgeExecutionClient(ExecutionClient):
@@ -220,7 +258,7 @@ class LongbridgeExecutionClient(ExecutionClient):
             self._connection_state = ConnectionState.FAILED
             logger.exception("failed to subscribe to Longbridge private order events")
             raise
-        await self._emit_account_state()
+        await self._reconcile_state()
 
     async def _trade_call(self, operation: Callable[[], Awaitable[Any]]) -> Any:
         await self._trade_rate.acquire()
@@ -274,6 +312,7 @@ class LongbridgeExecutionClient(ExecutionClient):
                         partial(trade.subscribe, [_sdk_class("TopicType").Private])
                     )
                     self._trade = trade
+                    await self._reconcile_state()
                 self._connection_state = ConnectionState.CONNECTED
                 logger.info("Longbridge trade connection restored")
                 return
@@ -292,6 +331,45 @@ class LongbridgeExecutionClient(ExecutionClient):
                     delay = min(self._lb_config.settings.reconnect_max_secs, delay * 2)
         self._connection_state = ConnectionState.FAILED
         logger.error("Longbridge trade reconnection failed after %d attempts", max_attempts)
+
+    async def _reconcile_state(self) -> None:
+        """Refresh broker state after connect/reconnect before accepting new work."""
+        await self._emit_account_state()
+        command = SimpleNamespace(
+            start=None,
+            end=None,
+            instrument_id=None,
+            open_only=False,
+            venue_order_id=None,
+            client_order_id=None,
+        )
+        try:
+            if self._trade is not None:
+                for value in await self._trade_call(self._trade.today_orders):
+                    await self._process_order_event(value)
+        except Exception:
+            logger.warning("Longbridge order push reconciliation failed", exc_info=True)
+        generators: tuple[Any, ...] = (
+            self._generate_order_status_reports,
+            self._generate_fill_reports,
+            self._generate_position_status_reports,
+        )
+        for generator in generators:
+            try:
+                for report in await generator(command):
+                    if isinstance(report, FillReport):
+                        self._seen_fills.add(str(report.trade_id))
+                    elif isinstance(report, OrderStatusReport):
+                        client = str(report.client_order_id) if report.client_order_id else ""
+                        if client:
+                            self._venue_by_client[client] = str(report.venue_order_id)
+                    self._handle_report(report)
+            except Exception:
+                logger.warning(
+                    "Longbridge typed reconciliation failed for %s",
+                    generator.__name__,
+                    exc_info=True,
+                )
 
     async def _disconnect(self) -> None:
         reconnect_task = getattr(self, "_reconnect_task", None)
@@ -379,7 +457,11 @@ class LongbridgeExecutionClient(ExecutionClient):
                 getattr(event, "quantity", getattr(order.quantity, "as_decimal", lambda: 0)()),
             )
         )
-        status = map_status(getattr(event, "status", None), filled, total)
+        try:
+            status = map_status(getattr(event, "status", None), filled, total)
+        except UnsupportedOperation as exc:
+            logger.error("Ignoring Longbridge order event with unsupported status: %s", exc)
+            return
         venue_id = VenueOrderId(venue_order_id)
         ts_event = timestamp_ns(getattr(event, "updated_at", None), self.clock.timestamp_ns())
         previous = self._last_status.get(client_order_id)
@@ -409,7 +491,7 @@ class LongbridgeExecutionClient(ExecutionClient):
         """Read collateral, cash and positions without enabling short selling.
 
         Returns only non-secret risk inputs. This is intentionally unavailable
-        for real-account clients; it is used by the ORB paper supervisor.
+        for real-account clients; it supports paper-account supervision.
         """
         if not self._lb_config.settings.paper_trading or self._trade is None:
             raise ConfigurationError("paper_snapshot requires a connected paper client")
@@ -865,6 +947,41 @@ class LongbridgeExecutionClient(ExecutionClient):
                 order, VenueOrderId(venue_id), str(exc), self.clock.timestamp_ns()
             )
 
+    async def _cancel_all_orders(self, command: Any) -> None:
+        instrument_id = getattr(command, "instrument_id", None)
+        order_side = getattr(command, "order_side", None)
+        strategy_id = getattr(command, "strategy_id", None)
+        for order in list(self._pending_orders.values()):
+            if instrument_id is not None and order.instrument_id != instrument_id:
+                continue
+            if order_side is not None and order.side != order_side:
+                continue
+            if strategy_id is not None and str(order.strategy_id) != str(strategy_id):
+                continue
+            client_id = str(order.client_order_id)
+            if self._last_status.get(client_id) in _TERMINAL_STATUSES:
+                continue
+            await self._cancel_order(SimpleNamespace(order=order))
+
+    async def _query_account(self, command: Any) -> None:
+        await self._emit_account_state()
+
+    async def _query_order(self, command: Any) -> None:
+        report = await self._generate_order_status_report(command)
+        if report is not None:
+            self._handle_report(report)
+
+    async def _submit_order_list(self, command: Any) -> None:
+        order_list = getattr(command, "order_list", None)
+        orders = list(getattr(order_list, "orders", []) or [])
+        if not orders:
+            orders = list(getattr(command, "order_inits", []) or [])
+        for order in orders:
+            self.generate_order_denied(
+                order,
+                "Longbridge order lists and contingent orders are unsupported",
+            )
+
     async def _cancel_order(self, command: Any) -> None:
         order = command.order
         key = str(order.client_order_id)
@@ -1055,35 +1172,165 @@ class LongbridgeExecutionClient(ExecutionClient):
     async def _generate_order_status_report(
         self, command: GenerateOrderStatusReport
     ) -> OrderStatusReport | None:
-        if self._trade is None:
-            return None
-        trade = self._trade
         venue_order_id = getattr(command, "venue_order_id", None)
-        values = await self._trade_call(
-            lambda: trade.today_orders(
-                order_id=str(venue_order_id) if venue_order_id else None,
+        client_order_id = getattr(command, "client_order_id", None)
+        values = await self._order_values_for_single_report(command)
+        for value in values:
+            try:
+                report = self._order_report(value)
+            except UnsupportedOperation:
+                continue
+            if venue_order_id is not None and str(report.venue_order_id) != str(venue_order_id):
+                continue
+            if client_order_id is not None and str(report.client_order_id) != str(client_order_id):
+                continue
+            if venue_order_id is None and client_order_id is None:
+                continue
+            return report
+        return None
+
+    async def _order_values_for_single_report(self, command: Any) -> list[Any]:
+        trade = self._trade
+        if trade is None:
+            return []
+        venue_order_id = getattr(command, "venue_order_id", None)
+        client_order_id = getattr(command, "client_order_id", None)
+        if venue_order_id is None and client_order_id is not None:
+            venue_order_id = self._venue_by_client.get(str(client_order_id))
+        symbol = None
+        if getattr(command, "instrument_id", None) is not None:
+            symbol = symbol_from_instrument_id(command.instrument_id)
+        if venue_order_id is not None:
+            values = await self._trade_call(
+                lambda: trade.today_orders(order_id=str(venue_order_id), symbol=symbol)
             )
+            if values:
+                return values
+            return await self._trade_call(lambda: trade.history_orders(symbol=symbol))
+        if client_order_id is not None:
+            values = await self._trade_call(lambda: trade.today_orders(symbol=symbol))
+            values += await self._trade_call(lambda: trade.history_orders(symbol=symbol))
+            return values
+        return await self._order_values_for_report(
+            SimpleNamespace(start=None, end=None, instrument_id=command.instrument_id)
         )
-        return self._order_report(values[0]) if values else None
+
+    async def _order_values_for_report(self, command: Any) -> list[Any]:
+        if self._trade is None:
+            return []
+        trade = self._trade
+        instrument_id = getattr(command, "instrument_id", None)
+        symbol = symbol_from_instrument_id(instrument_id) if instrument_id is not None else None
+        start = _command_datetime(getattr(command, "start", None))
+        end = _command_datetime(getattr(command, "end", None))
+        values = await self._trade_call(lambda: trade.today_orders(symbol=symbol))
+        if start is not None or end is not None:
+            values += await self._trade_call(
+                lambda: trade.history_orders(symbol=symbol, start_at=start, end_at=end)
+            )
+        return values
+
+    @staticmethod
+    def _report_in_range(report: Any, command: Any) -> bool:
+        start = _command_ns(getattr(command, "start", None))
+        end = _command_ns(getattr(command, "end", None))
+        return (
+            (start is None or report.ts_last >= start)
+            and (end is None or report.ts_last <= end)
+        )
+
+    async def _all_execution_values(
+        self,
+        trade: TradeContext,
+        *,
+        symbol: str | None,
+        order_id: str | None,
+    ) -> list[Any]:
+        """Read the paginated Longbridge execution history used by NT reports."""
+        values: list[Any] = []
+        page = 1
+        while True:
+            async def fetch_page(page_number: int = page) -> Any:
+                return await trade.all_executions(
+                    symbol=symbol,
+                    order_id=order_id,
+                    page=page_number,
+                )
+
+            response = await self._trade_call(fetch_page)
+            page_values = getattr(response, "trades", response)
+            values.extend(list(page_values or []))
+            if not bool(getattr(response, "has_more", False)):
+                return values
+            page += 1
+            if page > 1000:
+                raise RuntimeError("Longbridge execution pagination exceeded 1000 pages")
 
     async def _generate_order_status_reports(
         self, command: GenerateOrderStatusReports
     ) -> list[OrderStatusReport]:
-        if self._trade is None:
-            return []
-        trade = self._trade
-        values = await self._trade_call(trade.today_orders)
-        return [self._order_report(value) for value in values]
+        result: dict[str, OrderStatusReport] = {}
+        for value in await self._order_values_for_report(command):
+            try:
+                report = self._order_report(value)
+            except UnsupportedOperation:
+                logger.warning(
+                    "Skipping unsupported Longbridge order report %s", getattr(value, "order_id", "")
+                )
+                continue
+            if not self._report_in_range(report, command):
+                continue
+            if getattr(command, "instrument_id", None) is not None \
+                    and report.instrument_id != command.instrument_id:
+                continue
+            if getattr(command, "open_only", False) and report.order_status in _TERMINAL_STATUSES:
+                continue
+            key = str(report.venue_order_id)
+            previous = result.get(key)
+            if previous is None or report.ts_last >= previous.ts_last:
+                result[key] = report
+        return list(result.values())
 
     async def _generate_fill_reports(self, command: GenerateFillReports) -> list[FillReport]:
         if self._trade is None:
             return []
         trade = self._trade
         venue_order_id = getattr(command, "venue_order_id", None)
-        values = await self._trade_call(
-            lambda: trade.today_executions(order_id=str(venue_order_id) if venue_order_id else None)
-        )
-        return [self._fill_report(value) for value in values]
+        command_instrument_id = getattr(command, "instrument_id", None)
+        symbol = symbol_from_instrument_id(command_instrument_id) if command_instrument_id else None
+        start = _command_datetime(getattr(command, "start", None))
+        end = _command_datetime(getattr(command, "end", None))
+        order_id = str(venue_order_id) if venue_order_id else None
+        if start is None and end is None:
+            values = await self._all_execution_values(
+                trade,
+                symbol=symbol,
+                order_id=order_id,
+            )
+        else:
+            values = await self._trade_call(
+                lambda: trade.today_executions(symbol=symbol, order_id=order_id)
+            )
+            values += await self._trade_call(
+                lambda: trade.history_executions(symbol=symbol, start_at=start, end_at=end)
+            )
+        result: dict[str, FillReport] = {}
+        for value in values:
+            if venue_order_id is not None and str(value.order_id) != str(venue_order_id):
+                continue
+            report = self._fill_report(value)
+            if command_instrument_id is not None \
+                    and report.instrument_id != command.instrument_id:
+                continue
+            start_ns = _command_ns(getattr(command, "start", None))
+            end_ns = _command_ns(getattr(command, "end", None))
+            if not (
+                (start_ns is None or report.ts_event >= start_ns)
+                and (end_ns is None or report.ts_event <= end_ns)
+            ):
+                continue
+            result[str(report.trade_id)] = report
+        return list(result.values())
 
     async def _generate_position_status_reports(
         self, command: GeneratePositionStatusReports
@@ -1102,16 +1349,30 @@ class LongbridgeExecutionClient(ExecutionClient):
             if not symbol:
                 continue
             instrument_id = instrument_id_from_symbol(symbol)
+            if (
+                getattr(command, "instrument_id", None) is not None
+                and instrument_id != command.instrument_id
+            ):
+                continue
             qty = as_decimal(getattr(value, "quantity", getattr(value, "available_quantity", 0)))
+            side = (
+                PositionSide.LONG
+                if qty > 0
+                else PositionSide.SHORT
+                if qty < 0
+                else PositionSide.FLAT
+            )
             reports.append(
                 PositionStatusReport(
                     AccountId(self._lb_config.account_id),
                     instrument_id,
-                    PositionSide.LONG if qty >= 0 else PositionSide.SHORT,
+                    side,
                     quantity(abs(qty)),
                     self.clock.timestamp_ns(),
                     self.clock.timestamp_ns(),
-                    avg_px_open=as_decimal(getattr(value, "cost_price", 0)),
+                    avg_px_open=as_decimal(getattr(value, "cost_price", 0))
+                    if getattr(value, "cost_price", None) is not None
+                    else None,
                 )
             )
         return reports
@@ -1127,13 +1388,19 @@ class LongbridgeExecutionClient(ExecutionClient):
         client_id = getattr(value, "client_order_id", None)
         if not client_id:
             client_id = self._client_id_for_venue(str(value.order_id))
+        if not client_id:
+            remark = str(getattr(value, "remark", "") or "")
+            if remark.startswith("NT-"):
+                client_id = remark.removeprefix("NT-")
+        order_type = map_order_type_report(value.order_type)
         submitted_price = getattr(value, "submitted_price", getattr(value, "price", None))
+        executed_price = getattr(value, "executed_price", None)
         return OrderStatusReport(
             AccountId(self._lb_config.account_id),
             instrument_id,
             VenueOrderId(str(value.order_id)),
             OrderSide.BUY if "BUY" in enum_name(value.side) else OrderSide.SELL,
-            map_order_type_report(value.order_type),
+            order_type,
             map_tif_report(getattr(value, "time_in_force", None)),
             map_status(getattr(value, "status", None), filled, qty),
             quantity(qty),
@@ -1142,15 +1409,30 @@ class LongbridgeExecutionClient(ExecutionClient):
             timestamp_ns(getattr(value, "updated_at", None), self.clock.timestamp_ns()),
             self.clock.timestamp_ns(),
             client_order_id=ClientOrderId(str(client_id)) if client_id else None,
-            price=price(submitted_price, precision) if submitted_price is not None else None,
+            price=(price(submitted_price, precision)
+                   if order_type == OrderType.LIMIT and submitted_price is not None else None),
+            avg_px=as_decimal(executed_price) if executed_price is not None and filled > 0 else None,
         )
 
     def _fill_report(self, value: Any, client_order_id: ClientOrderId | None = None) -> FillReport:
         symbol = str(getattr(value, "symbol", ""))
         instrument_id = instrument_id_from_symbol(symbol)
         precision = self._price_precision(instrument_id)
+        provider: Any = getattr(self, "instrument_provider", None)
+        instrument = provider.find(instrument_id) if provider is not None else None
         currency = Currency.from_str(
-            str(getattr(value, "currency", self._lb_config.base_currency)).upper()
+            str(
+                getattr(
+                    value,
+                    "currency",
+                    getattr(instrument, "quote_currency", self._lb_config.base_currency),
+                )
+            ).upper()
+        )
+        logger.warning(
+            "Longbridge execution %s has no commission or liquidity-side fields; "
+            "emitting structural zero fee and NO_LIQUIDITY_SIDE",
+            self._execution_id(value),
         )
         return FillReport(
             AccountId(self._lb_config.account_id),
@@ -1161,7 +1443,7 @@ class LongbridgeExecutionClient(ExecutionClient):
             quantity(getattr(value, "quantity", getattr(value, "executed_quantity", 0))),
             price(getattr(value, "price", 0), precision),
             Money.from_decimal(as_decimal(getattr(value, "commission", 0)), currency),
-            LiquiditySide.TAKER,
+            LiquiditySide.NO_LIQUIDITY_SIDE,
             timestamp_ns(
                 getattr(
                     value,
@@ -1180,6 +1462,6 @@ class LongbridgeExecutionClient(ExecutionClient):
         )
 
     def _price_precision(self, instrument_id: Any) -> int:
-        provider = getattr(self, "instrument_provider", None)
+        provider: Any = getattr(self, "instrument_provider", None)
         instrument = provider.find(instrument_id) if provider is not None else None
         return int(getattr(instrument, "price_precision", 4))

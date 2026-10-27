@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.7 — 2026-10-27
+
+### NautilusTrader rc7 standard coverage
+
+- Add typed rc7 responses for Instrument(s), L2 book snapshots, depth and deltas, with
+  standard request and subscription routing for quotes, trades, bars and books.
+- Preserve L2 snapshot semantics when producing `OrderBookDeltas`; reject L3 MBO and
+  unsupported custom, derivative, funding, index, mark and instrument-status APIs explicitly.
+- Add account, order, fill and position report queries with instrument/time/open-order filters,
+  paginated historical executions, client-order-ID resolution and reconciliation after connect
+  and reconnect.
+- Keep Longbridge limitations visible in execution reports: missing commission/liquidity fields,
+  configured but unverified price increments, and unsupported order lists.
+
+### Validation
+
+- 118 connector tests pass locally on Python 3.14 with NautilusTrader 2.0.0rc7 and Longbridge
+  5.2.2; Ruff and mypy pass.
+
 ## 0.1.5 — 2026-10-25
 
 ### Bar catalog persistence
@@ -45,7 +64,7 @@
 - Limit margin mode to paper US-equity execution; it does not enable short
   selling, automatic currency exchange or real-account margin.
 
-### ORB data and execution support
+### Market data and paper execution support
 
 - Add confirmed-candle filtering, explicit supported bar periods and public
   connection-state accessors.

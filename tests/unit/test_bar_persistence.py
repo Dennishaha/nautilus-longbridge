@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from longbridge.openapi import Period
@@ -104,6 +105,32 @@ async def test_two_periods_for_one_symbol_restore_and_unsubscribe_independently(
     await client._unsubscribe_bars(commands[0])
     assert [entry[1] for entry in client._quote.bar_subscriptions] == [Period.Min_60]
     assert len(client._desired_bars) == 1
+
+
+@pytest.mark.asyncio
+async def test_live_all_session_subscription_keeps_night_selection_after_reconnect():
+    from longbridge.openapi import TradeSessions
+
+    client = _client()
+    client._lb_config.live_trade_sessions = "All"
+    client._quote = FakeQuoteContext()
+    client._quote.static_info = AsyncMock(
+        return_value=[SimpleNamespace(symbol="AAPL.US", currency="USD", lot_size=1)]
+    )
+    client.instrument_provider.set_quote_context(client._quote)
+    client._handle_instrument = lambda _: None
+    client._desired_bars, client._desired_quotes, client._desired_trades = {}, set(), set()
+    selections = []
+
+    async def subscribe(symbol, period, trade_sessions):
+        selections.append(trade_sessions)
+        return []
+
+    client._quote.subscribe_candlesticks = subscribe
+    command = SimpleNamespace(bar_type=BarType.from_str("AAPL.US.LONGBRIDGE-1-MINUTE-LAST-EXTERNAL"))
+    await client._subscribe_bars(command)
+    await client._restore_subscriptions()
+    assert selections == [TradeSessions.All, TradeSessions.All]
 
 
 @pytest.mark.asyncio

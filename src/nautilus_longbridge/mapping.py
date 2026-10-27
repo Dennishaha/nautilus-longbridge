@@ -49,9 +49,12 @@ def enum_name(value: Any) -> str:
 
 
 def aggressor_side(direction: Any) -> AggressorSide:
+    # Longbridge Up/Down describe price movement relative to the previous trade,
+    # not a certified initiating side. Preserve unknown rather than fabricate
+    # market-buy/market-sell volume from tick direction.
     name = enum_name(direction)
-    if name in {"UP", "BUY", "BUYER"}:
+    if name in {"BUY", "BUYER"}:
         return AggressorSide.BUY
-    if name in {"DOWN", "SELL", "SELLER"}:
+    if name in {"SELL", "SELLER"}:
         return AggressorSide.SELL
     return AggressorSide.NO_AGGRESSOR

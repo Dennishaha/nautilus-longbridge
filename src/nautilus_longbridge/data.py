@@ -10,7 +10,17 @@ from functools import partial
 from types import SimpleNamespace
 from typing import Any
 
-from nautilus_trader.live import BarsResponse, QuotesResponse, TradesResponse
+from nautilus_trader.core import UUID4
+from nautilus_trader.live import (
+    BarsResponse,
+    BookDeltasResponse,
+    BookDepthResponse,
+    BookResponse,
+    InstrumentResponse,
+    InstrumentsResponse,
+    QuotesResponse,
+    TradesResponse,
+)
 from nautilus_trader.live.clients import DataClient
 from nautilus_trader.model import (
     AggregationSource,
@@ -18,18 +28,26 @@ from nautilus_trader.model import (
     BarAggregation,
     BarSpecification,
     BarType,
+    BookAction,
     BookOrder,
+    BookType,
+    ClientId,
     InstrumentId,
+    OrderBook,
+    OrderBookDelta,
+    OrderBookDeltas,
     OrderBookDepth,
     OrderSide,
     PriceType,
     QuoteTick,
+    RecordFlag,
     TradeId,
     TradeTick,
 )
 
 from .config import LongbridgeDataClientConfig
 from .dedup import TimedDeduplicator
+from .errors import ConfigurationError, UnsupportedOperation
 from .instruments import LongbridgeInstrumentProvider
 from .lifecycle import ConnectionState
 from .mapping import aggressor_side, price, quantity, timestamp_ns
@@ -38,6 +56,15 @@ from .symbols import instrument_id_from_symbol, symbol_from_instrument_id
 from .transport import ContextFactory, LongbridgeContextFactory, QuoteContext
 
 logger = logging.getLogger(__name__)
+
+
+def _dispatch_response(client: Any, response: Any) -> None:
+    """Dispatch through the connector helper while keeping adapter hooks duck-testable."""
+    handler = getattr(client, "_emit_response", None)
+    if callable(handler):
+        handler(response)
+    else:
+        client._handle_response(response)
 
 
 def _sdk_enum(name: str, fallback: Any = None) -> Any:
@@ -98,6 +125,8 @@ class LongbridgeDataClient(DataClient):
         self._last_confirmed_bars: dict[str, Bar] = {}
         self._accepting_events = False
         self._desired_depth: set[str] = set()
+        self._desired_book_depth: dict[str, int] = {}
+        self._desired_book_deltas: set[str] = set()
         self._last_quotes: dict[str, Any] = {}
         self._last_depth: dict[str, Any] = {}
         self._depth_received_ns: dict[str, int] = {}
@@ -116,6 +145,24 @@ class LongbridgeDataClient(DataClient):
     @property
     def connection_state(self) -> ConnectionState:
         return self._connection_state
+
+    def _now_ns(self) -> int:
+        clock = getattr(self, "clock", None)
+        return clock.timestamp_ns() if clock is not None else 0
+
+    def _emit_response(self, response: Any) -> None:
+        sink = getattr(self, "_response_sink", None)
+        if sink is not None:
+            sink(response)
+        elif "_handle_response" in getattr(self, "__dict__", {}) or hasattr(self, "_output"):
+            self._handle_response(response)
+
+    def _response_client_id(self) -> Any:
+        return getattr(self, "client_id", ClientId("LONGBRIDGE-DATA"))
+
+    @staticmethod
+    def _response_request_id(request: Any) -> Any:
+        return getattr(request, "request_id", UUID4())
 
     async def _connect(self) -> None:
         self._connection_state = ConnectionState.CONNECTING
@@ -154,11 +201,19 @@ class LongbridgeDataClient(DataClient):
                             sorted(self._desired_quotes), [SubType.Quote, SubType.Depth]
                         )
                     )
-                if self._desired_trades:
+                depth_only = (
+                    getattr(self, "_desired_depth", set())
+                    | getattr(self, "_desired_book_deltas", set())
+                ) - self._desired_quotes
+                if depth_only:
+                    await self._quote_call(
+                        lambda: quote.unsubscribe(sorted(depth_only), [SubType.Depth])
+                    )
+                if getattr(self, "_desired_trades", set()):
                     await self._quote_call(
                         lambda: quote.unsubscribe(sorted(self._desired_trades), [SubType.Trade])
                     )
-                for (symbol, _), period in self._desired_bars.items():
+                for (symbol, _), period in getattr(self, "_desired_bars", {}).items():
                     await self._quote_call(partial(quote.unsubscribe_candlesticks, symbol, period))
             except Exception:
                 logger.debug("Longbridge quote unsubscribe during disconnect failed", exc_info=True)
@@ -186,6 +241,7 @@ class LongbridgeDataClient(DataClient):
             self._consumer = None
             self._queue = None
             self._quote = None
+            self._reference_trade = None
 
     async def _health_loop(self) -> None:
         while True:
@@ -339,6 +395,14 @@ class LongbridgeDataClient(DataClient):
                     sorted(self._desired_quotes), [SubType.Quote, SubType.Depth]
                 )
             )
+        depth_only = (
+            getattr(self, "_desired_depth", set())
+            | getattr(self, "_desired_book_deltas", set())
+        ) - self._desired_quotes
+        if depth_only:
+            await self._quote_call(
+                lambda: quote.subscribe(sorted(depth_only), [SubType.Depth])
+            )
         if self._desired_trades:
             await self._quote_call(
                 lambda: quote.subscribe(sorted(self._desired_trades), [SubType.Trade])
@@ -346,7 +410,8 @@ class LongbridgeDataClient(DataClient):
         for (symbol, _), period in self._desired_bars.items():
             await self._ensure_instrument(symbol)
             await self._quote_call(
-                partial(quote.subscribe_candlesticks, symbol, period, TradeSessions.Intraday)
+                partial(quote.subscribe_candlesticks, symbol, period,
+                        getattr(TradeSessions, self._lb_config.live_trade_sessions))
             )
 
     async def _quote_call(self, operation: Callable[[], Awaitable[Any]]) -> Any:
@@ -388,7 +453,13 @@ class LongbridgeDataClient(DataClient):
                 if kind == "quote":
                     await self._publish_quote(symbol, event)
                 elif kind == "depth":
-                    await self._publish_depth(symbol, event, received_ns=received_ns)
+                    await self._publish_depth(
+                        symbol,
+                        event,
+                        received_ns=received_ns,
+                        publish_depth=symbol in getattr(self, "_desired_book_depth", {}),
+                        publish_deltas=symbol in getattr(self, "_desired_book_deltas", set()),
+                    )
                 elif kind == "trades":
                     await self._publish_trades(symbol, event)
                 elif kind == "bar":
@@ -464,7 +535,13 @@ class LongbridgeDataClient(DataClient):
         )
 
     async def _publish_depth(
-        self, symbol: str, event: Any, *, received_ns: int | None = None
+        self,
+        symbol: str,
+        event: Any,
+        *,
+        received_ns: int | None = None,
+        publish_depth: bool = True,
+        publish_deltas: bool | None = None,
     ) -> None:
         if received_ns is not None and received_ns < getattr(self, "_depth_epoch_ns", 0):
             return
@@ -476,53 +553,94 @@ class LongbridgeDataClient(DataClient):
         )
         ts_event = timestamp_ns(getattr(event, "timestamp", None), self.clock.timestamp_ns())
         instrument_id = await self._ensure_instrument(symbol)
-        bids = [
-            row for row in getattr(event, "bids", []) if getattr(row, "price", None) is not None
-        ]
-        asks = [
-            row for row in getattr(event, "asks", []) if getattr(row, "price", None) is not None
-        ]
-        key = (
-            f"depth:{symbol}:{ts_event}:{[(str(x.price), x.volume) for x in bids]}:"
-            f"{[(str(x.price), x.volume) for x in asks]}"
+        if publish_deltas is None:
+            publish_deltas = symbol in getattr(self, "_desired_book_deltas", set())
+        depth, deltas, _ = self._make_book(
+            instrument_id,
+            event,
+            ts_event,
+            depth_limit=getattr(self, "_desired_book_depth", {}).get(symbol),
         )
+        key = f"depth:{symbol}:{ts_event}:{depth.bids}:{depth.asks}"
         if not self._dedup(key):
             return
-        self._handle_data(
-            OrderBookDepth(
-                instrument_id,
-                [
-                    BookOrder(
-                        OrderSide.BUY,
-                        price(row.price, self._lb_config.price_precision),
-                        quantity(row.volume),
-                        int(row.position),
-                    )
-                    for row in bids
-                ],
-                [
-                    BookOrder(
-                        OrderSide.SELL,
-                        price(row.price, self._lb_config.price_precision),
-                        quantity(row.volume),
-                        int(row.position),
-                    )
-                    for row in asks
-                ],
-                [int(row.order_num) for row in bids],
-                [int(row.order_num) for row in asks],
-                0,
-                0,
-                ts_event,
-                self.clock.timestamp_ns(),
-            )
-        )
+        if publish_depth:
+            self._handle_data(depth)
+        if publish_deltas:
+            self._handle_data(deltas)
         if symbol in getattr(self, "_desired_quotes", set()) or symbol in self._last_quotes:
             tick = self._make_quote_tick(
                 instrument_id, symbol, self._last_quotes.get(symbol), event
             )
             if tick is not None:
                 self._handle_data(tick)
+
+    def _make_book(
+        self,
+        instrument_id: InstrumentId,
+        event: Any,
+        ts_event: int,
+        depth_limit: int | None = None,
+    ) -> tuple[OrderBookDepth, OrderBookDeltas, OrderBook]:
+        bids = [
+            row for row in getattr(event, "bids", []) if getattr(row, "price", None) is not None
+        ]
+        asks = [
+            row for row in getattr(event, "asks", []) if getattr(row, "price", None) is not None
+        ]
+        if depth_limit:
+            depth_limit = max(1, int(depth_limit))
+            bids = bids[:depth_limit]
+            asks = asks[:depth_limit]
+        ts_init = self.clock.timestamp_ns()
+        flags = RecordFlag.F_SNAPSHOT.value
+        depth = OrderBookDepth(
+            instrument_id,
+            [
+                BookOrder(
+                    OrderSide.BUY,
+                    price(row.price, self._lb_config.price_precision),
+                    quantity(row.volume),
+                    int(row.position),
+                )
+                for row in bids
+            ],
+            [
+                BookOrder(
+                    OrderSide.SELL,
+                    price(row.price, self._lb_config.price_precision),
+                    quantity(row.volume),
+                    int(row.position),
+                )
+                for row in asks
+            ],
+            [int(row.order_num) for row in bids],
+            [int(row.order_num) for row in asks],
+            flags,
+            0,
+            ts_event,
+            ts_init,
+        )
+        raw_deltas = [OrderBookDelta.clear(instrument_id, 0, ts_event, ts_init)]
+        for order in [*depth.bids, *depth.asks]:
+            raw_deltas.append(
+                OrderBookDelta(instrument_id, BookAction.ADD, order, flags, 0, ts_event, ts_init)
+            )
+        if len(raw_deltas) > 1:
+            last = raw_deltas[-1]
+            raw_deltas[-1] = OrderBookDelta(
+                instrument_id,
+                last.action,
+                last.order,
+                flags | RecordFlag.F_LAST.value,
+                last.sequence,
+                last.ts_event,
+                last.ts_init,
+            )
+        deltas = OrderBookDeltas(instrument_id, raw_deltas)
+        book = OrderBook(instrument_id, BookType.L2_MBP)
+        book.apply_deltas(deltas)
+        return depth, deltas, book
 
     async def _publish_trades(self, symbol: str, event: Any) -> None:
         instrument_id = await self._ensure_instrument(symbol)
@@ -587,6 +705,121 @@ class LongbridgeDataClient(DataClient):
             self._last_confirmed_bars[str(bar_type)] = bar
         self._handle_data(bar)
 
+    async def _request_instrument(self, request: Any) -> None:
+        provider = self.instrument_provider
+        if not isinstance(provider, LongbridgeInstrumentProvider):
+            raise ValueError("Longbridge instrument provider required")
+        symbol = symbol_from_instrument_id(request.instrument_id)
+        if (getattr(request, "params", None) or {}).get("account_reference"):
+            if not self._lb_config.reference_account_enabled:
+                raise ValueError("account reference requests require explicit connector configuration")
+            from .reference import account_reference
+
+            context = getattr(self, "_reference_trade", None)
+            if context is None:
+                context = self._context_factory.trade(self._lb_config.settings, asyncio.get_running_loop())
+                self._reference_trade = context
+            reference = await account_reference(context, symbol, received_ns=self.clock.timestamp_ns(),
+                                                timeout=self._lb_config.settings.request_timeout_secs)
+            reference["received_ns"] = self.clock.timestamp_ns()
+            # Rehash with actual completion/availability time, never backdate it.
+            import hashlib
+            import json
+
+            reference.pop("source_sha256", None)
+            reference["source_sha256"] = hashlib.sha256(json.dumps(reference, sort_keys=True,
+                separators=(",", ":")).encode()).hexdigest()
+            quote = self._quote
+            if quote is None:
+                raise RuntimeError("quote context is not connected")
+            infos = await self._quote_call(lambda: quote.static_info([symbol]))
+            if len(infos) != 1 or str(getattr(infos[0], "symbol", "")).upper() != symbol:
+                raise ConfigurationError(
+                    f"Longbridge static_info returned no unique instrument for {symbol}"
+                )
+            referenced = provider._to_equity(infos[0], reference=reference)
+            self._handle_instrument(referenced)
+            _dispatch_response(self,
+                InstrumentResponse(
+                    getattr(self, "client_id", ClientId("LONGBRIDGE-DATA")),
+                    referenced.id,
+                    referenced,
+                    getattr(request, "request_id", UUID4()),
+                    self._now_ns(),
+                )
+            )
+            return
+        await provider.load_symbols_async([symbol])
+        instrument: Any = provider.find(request.instrument_id)
+        if instrument is None:
+            raise ValueError(f"Longbridge returned no instrument for {symbol}")
+        self._handle_instrument(instrument)
+        _dispatch_response(self,
+            InstrumentResponse(
+                getattr(self, "client_id", ClientId("LONGBRIDGE-DATA")),
+                instrument.id,
+                instrument,
+                getattr(request, "request_id", UUID4()),
+                self._now_ns(),
+            )
+        )
+
+    async def _load_instrument_params(self, params: Any) -> list[Any]:
+        provider = self.instrument_provider
+        if not isinstance(provider, LongbridgeInstrumentProvider):
+            raise ConfigurationError("Longbridge instrument provider required")
+        params = params or {}
+        symbols = params.get("symbols")
+        if symbols is None:
+            identifiers = params.get("instrument_ids") or params.get("load_ids")
+            if identifiers:
+                symbols = [symbol_from_instrument_id(identifier) for identifier in identifiers]
+        if symbols:
+            await provider.load_symbols_async(list(symbols))
+        values: list[Any] = list(provider.list_all())
+        if not values:
+            raise UnsupportedOperation(
+                "Longbridge cannot enumerate all securities; configure instrument symbols"
+            )
+        return values
+
+    async def _request_instruments(self, request: Any) -> None:
+        values = await self._load_instrument_params(getattr(request, "params", None))
+        for value in values:
+            self._handle_instrument(value)
+        venue = getattr(request, "venue", None) or getattr(self, "venue", None)
+        if venue is None:
+            raise ConfigurationError("Longbridge instrument response requires a venue")
+        _dispatch_response(self,
+            InstrumentsResponse(
+                getattr(self, "client_id", ClientId("LONGBRIDGE-DATA")),
+                venue,
+                values,
+                getattr(request, "request_id", UUID4()),
+                self._now_ns(),
+            )
+        )
+
+    async def _subscribe_instrument(self, command: Any) -> None:
+        if not isinstance(self.instrument_provider, LongbridgeInstrumentProvider):
+            raise ConfigurationError("Longbridge instrument provider required")
+        symbol = symbol_from_instrument_id(command.instrument_id)
+        await self.instrument_provider.load_symbols_async([symbol])
+        instrument = self.instrument_provider.find(command.instrument_id)
+        if instrument is None:
+            raise ConfigurationError(f"Longbridge returned no instrument for {symbol}")
+        self._handle_instrument(instrument)
+
+    async def _subscribe_instruments(self, command: Any) -> None:
+        for value in await self._load_instrument_params(getattr(command, "params", None)):
+            self._handle_instrument(value)
+
+    async def _unsubscribe_instrument(self, command: Any) -> None:
+        return
+
+    async def _unsubscribe_instruments(self, command: Any) -> None:
+        return
+
     async def _ensure_instrument(self, symbol: str) -> InstrumentId:
         instrument_id = instrument_id_from_symbol(symbol)
         provider = self.instrument_provider
@@ -596,8 +829,15 @@ class LongbridgeDataClient(DataClient):
         ):
             await provider.load_symbols_async([symbol])
             instrument = provider.find(instrument_id)
-            if instrument is not None:
-                self._handle_instrument(instrument)
+            if instrument is None:
+                raise ConfigurationError(f"Longbridge returned no instrument for {symbol}")
+            self._handle_instrument(instrument)
+        elif provider is not None:
+            instrument = provider.find(instrument_id)
+            if instrument is None:
+                raise ConfigurationError(f"Longbridge instrument is not loaded for {symbol}")
+        else:
+            raise ConfigurationError(f"Longbridge instrument provider is unavailable for {symbol}")
         return instrument_id
 
     async def _subscribe_quotes(self, command: Any) -> None:
@@ -606,6 +846,7 @@ class LongbridgeDataClient(DataClient):
         self._desired_depth.add(symbol)
         quote = self._quote
         if quote is not None:
+            await self._ensure_instrument(symbol)
             from longbridge.openapi import SubType
 
             await self._quote_call(
@@ -615,20 +856,29 @@ class LongbridgeDataClient(DataClient):
     async def _unsubscribe_quotes(self, command: Any) -> None:
         symbol = symbol_from_instrument_id(command.instrument_id)
         self._desired_quotes.discard(symbol)
-        self._desired_depth.discard(symbol)
+        if (
+            symbol not in getattr(self, "_desired_book_depth", {})
+            and symbol not in getattr(self, "_desired_book_deltas", set())
+        ):
+            self._desired_depth.discard(symbol)
         quote = self._quote
         if quote is not None:
             from longbridge.openapi import SubType
-
-            await self._quote_call(
-                lambda: quote.unsubscribe([symbol], [SubType.Quote, SubType.Depth])
-            )
+            if symbol in getattr(self, "_desired_book_depth", {}) or symbol in getattr(
+                self, "_desired_book_deltas", set()
+            ):
+                await self._quote_call(lambda: quote.unsubscribe([symbol], [SubType.Quote]))
+            else:
+                await self._quote_call(
+                    lambda: quote.unsubscribe([symbol], [SubType.Quote, SubType.Depth])
+                )
 
     async def _subscribe_trades(self, command: Any) -> None:
         symbol = symbol_from_instrument_id(command.instrument_id)
         self._desired_trades.add(symbol)
         quote = self._quote
         if quote is not None:
+            await self._ensure_instrument(symbol)
             from longbridge.openapi import SubType
 
             await self._quote_call(lambda: quote.subscribe([symbol], [SubType.Trade]))
@@ -652,7 +902,8 @@ class LongbridgeDataClient(DataClient):
 
             await self._ensure_instrument(symbol)
             await self._quote_call(
-                lambda: quote.subscribe_candlesticks(symbol, period, TradeSessions.Intraday)
+                lambda: quote.subscribe_candlesticks(symbol, period,
+                                                     getattr(TradeSessions, self._lb_config.live_trade_sessions))
             )
 
     async def _unsubscribe_bars(self, command: Any) -> None:
@@ -668,27 +919,51 @@ class LongbridgeDataClient(DataClient):
         if quote is None:
             return
         symbol = symbol_from_instrument_id(request.instrument_id)
-        values = await self._quote_call(lambda: quote.quote([symbol]))
+        await self._ensure_instrument(symbol)
         data: list[Any] = []
-        for value in values:
-            self._last_quotes[symbol] = value
-            depth = await self._quote_call(lambda: quote.depth(symbol))
-            self._last_depth[symbol] = depth
-            if not hasattr(self, "_depth_received_ns"):
-                self._depth_received_ns = {}
-            self._depth_received_ns[symbol] = self.clock.timestamp_ns()
-            tick = self._make_quote_tick(request.instrument_id, symbol, value, depth)
-            if tick is not None:
-                data.append(tick)
-        self._handle_response(
+        evidence = None
+        directory = getattr(self._lb_config, "historical_evidence_dir", None)
+        if directory:
+            from .evidence import QuoteEvidence
+
+            evidence = QuoteEvidence(directory, str(request.request_id), symbol)
+        try:
+            values = await self._quote_call(lambda: quote.quote([symbol]))
+            if evidence:
+                evidence.capture_quotes(values, self.clock.timestamp_ns())
+            for value in values:
+                self._last_quotes[symbol] = value
+                depth = await self._quote_call(lambda: quote.depth(symbol))
+                received_ns = self.clock.timestamp_ns()
+                if evidence:
+                    evidence.capture_depth(depth, received_ns)
+                self._last_depth[symbol] = depth
+                if not hasattr(self, "_depth_received_ns"):
+                    self._depth_received_ns = {}
+                self._depth_received_ns[symbol] = received_ns
+                tick = self._make_quote_tick(request.instrument_id, symbol, value, depth)
+                if tick is not None and (
+                    (request.start_ns is None or tick.ts_event >= request.start_ns)
+                    and (request.end_ns is None or tick.ts_event <= request.end_ns)
+                ):
+                    data.append(tick)
+        except BaseException as exc:
+            if evidence:
+                evidence.finish(len(data), exc)
+            raise
+        else:
+            if evidence:
+                evidence.finish(len(data))
+        _dispatch_response(self,
             QuotesResponse(
-                self.client_id,
+                getattr(self, "client_id", ClientId("LONGBRIDGE-DATA")),
                 request.instrument_id,
                 data,
-                request.request_id,
+                getattr(request, "request_id", UUID4()),
                 self.clock.timestamp_ns(),
                 request.start_ns,
                 request.end_ns,
+                {"coverage": "current_snapshot_only"},
             )
         )
 
@@ -697,11 +972,17 @@ class LongbridgeDataClient(DataClient):
         if quote is None:
             return
         symbol = symbol_from_instrument_id(request.instrument_id)
-        values = await self._quote_call(lambda: quote.trades(symbol, request.limit or 1000))
+        await self._ensure_instrument(symbol)
+        limit = min(request.limit or 1000, 1000)
+        values = await self._quote_call(lambda: quote.trades(symbol, limit))
         data: list[Any] = []
         for item in values:
             ts_event = timestamp_ns(getattr(item, "timestamp", None), self.clock.timestamp_ns())
             digest = self._trade_digest(symbol, item, ts_event)
+            if request.start_ns is not None and ts_event < request.start_ns:
+                continue
+            if request.end_ns is not None and ts_event > request.end_ns:
+                continue
             data.append(
                 TradeTick(
                     request.instrument_id,
@@ -713,15 +994,20 @@ class LongbridgeDataClient(DataClient):
                     self.clock.timestamp_ns(),
                 )
             )
-        self._handle_response(
+        _dispatch_response(self,
             TradesResponse(
-                self.client_id,
+                getattr(self, "client_id", ClientId("LONGBRIDGE-DATA")),
                 request.instrument_id,
                 data,
-                request.request_id,
+                getattr(request, "request_id", UUID4()),
                 self.clock.timestamp_ns(),
                 request.start_ns,
                 request.end_ns,
+                {
+                    "coverage": "recent_limited_ticks_only",
+                    "requested_start_ns": request.start_ns,
+                    "requested_end_ns": request.end_ns,
+                },
             )
         )
 
@@ -736,6 +1022,7 @@ class LongbridgeDataClient(DataClient):
 
         period = _period_for_bar_type(request.bar_type)
         adjustment = getattr(self._lb_config, "historical_adjustment", "NoAdjust")
+        trade_sessions = getattr(self._lb_config, "historical_trade_sessions", "Intraday")
         evidence = None
         try:
             if request.start_ns is not None or request.end_ns is not None:
@@ -746,7 +1033,9 @@ class LongbridgeDataClient(DataClient):
                 directory = getattr(self._lb_config, "historical_evidence_dir", None)
                 if directory is not None:
                     evidence = HistoryEvidence(
-                        directory, str(request.request_id), symbol, str(period), adjustment
+                        directory, str(request.request_id), symbol, str(period), adjustment,
+                        trade_sessions,
+                        enable_overnight=self._lb_config.settings.enable_overnight,
                     )
                 values = await history_candles(
                     quote,
@@ -757,6 +1046,8 @@ class LongbridgeDataClient(DataClient):
                     request.end_ns if request.end_ns is not None else self.clock.timestamp_ns(),
                     call=self._quote_call,
                     evidence=evidence.capture if evidence else None,
+                    error_evidence=evidence.capture_error if evidence else None,
+                    trade_sessions=trade_sessions,
                 )
                 if request.limit:
                     values = values[-request.limit :]
@@ -767,7 +1058,7 @@ class LongbridgeDataClient(DataClient):
                         period,
                         request.limit or 1000,
                         getattr(AdjustType, adjustment),
-                        TradeSessions.Intraday,
+                        getattr(TradeSessions, trade_sessions),
                     )
                 )
             await self._ensure_instrument(symbol)
@@ -789,12 +1080,12 @@ class LongbridgeDataClient(DataClient):
                         ts_init,
                     )
                 )
-            self._handle_response(
+            _dispatch_response(self,
                 BarsResponse(
-                    self.client_id,
+                    getattr(self, "client_id", ClientId("LONGBRIDGE-DATA")),
                     request.bar_type,
                     data,
-                    request.request_id,
+                    getattr(request, "request_id", UUID4()),
                     self.clock.timestamp_ns(),
                     # The adapter has already filtered by ts_event. rc7's
                     # response bounds trim by ts_init and would drop fetched
@@ -815,6 +1106,175 @@ class LongbridgeDataClient(DataClient):
         quote = self._quote
         if quote is None:
             return
+        self._check_book_type(request)
         symbol = symbol_from_instrument_id(request.instrument_id)
         value = await self._quote_call(lambda: quote.depth(symbol))
-        await self._publish_depth(symbol, value)
+        instrument_id = await self._ensure_instrument(symbol)
+        _, _, book = self._make_book(
+            instrument_id,
+            value,
+            self.clock.timestamp_ns(),
+            depth_limit=getattr(request, "depth", None),
+        )
+        _dispatch_response(self,
+            BookResponse(
+                getattr(self, "client_id", ClientId("LONGBRIDGE-DATA")),
+                request.instrument_id,
+                book,
+                getattr(request, "request_id", UUID4()),
+                self.clock.timestamp_ns(),
+            )
+        )
+
+    def _check_book_type(self, request: Any) -> None:
+        if getattr(request, "book_type", BookType.L2_MBP) != BookType.L2_MBP:
+            raise UnsupportedOperation("Longbridge provides L2 price-level depth, not L3 MBO")
+
+    async def _request_book_depth(self, request: Any) -> None:
+        quote = self._quote
+        if quote is None:
+            return
+        self._check_book_type(request)
+        symbol = symbol_from_instrument_id(request.instrument_id)
+        value = await self._quote_call(lambda: quote.depth(symbol))
+        instrument_id = await self._ensure_instrument(symbol)
+        depth, _, _ = self._make_book(
+            instrument_id,
+            value,
+            self.clock.timestamp_ns(),
+            depth_limit=getattr(request, "depth", None) or getattr(request, "limit", None),
+        )
+        _dispatch_response(self,
+            BookDepthResponse(
+                getattr(self, "client_id", ClientId("LONGBRIDGE-DATA")),
+                request.instrument_id,
+                [depth],
+                getattr(request, "request_id", UUID4()),
+                self.clock.timestamp_ns(),
+            )
+        )
+
+    async def _request_book_deltas(self, request: Any) -> None:
+        quote = self._quote
+        if quote is None:
+            return
+        self._check_book_type(request)
+        symbol = symbol_from_instrument_id(request.instrument_id)
+        value = await self._quote_call(lambda: quote.depth(symbol))
+        instrument_id = await self._ensure_instrument(symbol)
+        _, deltas, _ = self._make_book(
+            instrument_id,
+            value,
+            self.clock.timestamp_ns(),
+            depth_limit=getattr(request, "limit", None),
+        )
+        _dispatch_response(self,
+            BookDeltasResponse(
+                getattr(self, "client_id", ClientId("LONGBRIDGE-DATA")),
+                request.instrument_id,
+                deltas.deltas,
+                getattr(request, "request_id", UUID4()),
+                self.clock.timestamp_ns(),
+            )
+        )
+
+    async def _subscribe_book_depth(self, command: Any) -> None:
+        self._check_book_type(command)
+        symbol = symbol_from_instrument_id(command.instrument_id)
+        if not hasattr(self, "_desired_book_depth"):
+            self._desired_book_depth = {}
+        if not hasattr(self, "_desired_book_deltas"):
+            self._desired_book_deltas = set()
+        self._desired_book_depth[symbol] = getattr(command, "depth", None) or 10
+        self._desired_depth.add(symbol)
+        await self._subscribe_depth_only(symbol)
+
+    async def _unsubscribe_book_depth(self, command: Any) -> None:
+        symbol = symbol_from_instrument_id(command.instrument_id)
+        getattr(self, "_desired_book_depth", {}).pop(symbol, None)
+        await self._maybe_unsubscribe_depth(symbol)
+
+    async def _subscribe_book_deltas(self, command: Any) -> None:
+        self._check_book_type(command)
+        symbol = symbol_from_instrument_id(command.instrument_id)
+        if not hasattr(self, "_desired_book_deltas"):
+            self._desired_book_deltas = set()
+        self._desired_book_deltas.add(symbol)
+        self._desired_depth.add(symbol)
+        await self._subscribe_depth_only(symbol)
+
+    async def _unsubscribe_book_deltas(self, command: Any) -> None:
+        symbol = symbol_from_instrument_id(command.instrument_id)
+        getattr(self, "_desired_book_deltas", set()).discard(symbol)
+        await self._maybe_unsubscribe_depth(symbol)
+
+    async def _subscribe_depth_only(self, symbol: str) -> None:
+        quote = self._quote
+        if quote is None or symbol in self._desired_quotes:
+            return
+        await self._ensure_instrument(symbol)
+        from longbridge.openapi import SubType
+
+        await self._quote_call(lambda: quote.subscribe([symbol], [SubType.Depth]))
+
+    async def _maybe_unsubscribe_depth(self, symbol: str) -> None:
+        if symbol in self._desired_quotes or symbol in getattr(self, "_desired_book_depth", {}) \
+                or symbol in getattr(self, "_desired_book_deltas", set()):
+            return
+        self._desired_depth.discard(symbol)
+        quote = self._quote
+        if quote is not None:
+            from longbridge.openapi import SubType
+
+            await self._quote_call(lambda: quote.unsubscribe([symbol], [SubType.Depth]))
+
+    async def _request_data(self, request: Any) -> None:
+        raise UnsupportedOperation("Longbridge custom data is not supported")
+
+    async def _subscribe(self, command: Any) -> None:
+        raise UnsupportedOperation("Longbridge custom data subscriptions are not supported")
+
+    async def _unsubscribe(self, command: Any) -> None:
+        raise UnsupportedOperation("Longbridge custom data subscriptions are not supported")
+
+    async def _request_funding_rates(self, request: Any) -> None:
+        raise UnsupportedOperation("Longbridge funding rates are not supported")
+
+    async def _subscribe_funding_rates(self, command: Any) -> None:
+        raise UnsupportedOperation("Longbridge funding rates are not supported")
+
+    async def _unsubscribe_funding_rates(self, command: Any) -> None:
+        raise UnsupportedOperation("Longbridge funding rates are not supported")
+
+    async def _request_option_chain_reference_price(self, request: Any) -> None:
+        raise UnsupportedOperation("Longbridge option reference prices are not supported")
+
+    async def _subscribe_index_prices(self, command: Any) -> None:
+        raise UnsupportedOperation("Longbridge index prices are not supported")
+
+    async def _unsubscribe_index_prices(self, command: Any) -> None:
+        raise UnsupportedOperation("Longbridge index prices are not supported")
+
+    async def _subscribe_instrument_close(self, command: Any) -> None:
+        raise UnsupportedOperation("Longbridge instrument close data is not supported")
+
+    async def _unsubscribe_instrument_close(self, command: Any) -> None:
+        raise UnsupportedOperation("Longbridge instrument close data is not supported")
+
+    async def _subscribe_instrument_status(self, command: Any) -> None:
+        raise UnsupportedOperation("Longbridge instrument status data is not supported")
+
+    async def _unsubscribe_instrument_status(self, command: Any) -> None:
+        raise UnsupportedOperation("Longbridge instrument status data is not supported")
+
+    async def _subscribe_mark_prices(self, command: Any) -> None:
+        raise UnsupportedOperation("Longbridge mark prices are not supported")
+
+    async def _unsubscribe_mark_prices(self, command: Any) -> None:
+        raise UnsupportedOperation("Longbridge mark prices are not supported")
+
+    async def _subscribe_option_greeks(self, command: Any) -> None:
+        raise UnsupportedOperation("Longbridge option greeks are not supported")
+
+    async def _unsubscribe_option_greeks(self, command: Any) -> None:
+        raise UnsupportedOperation("Longbridge option greeks are not supported")

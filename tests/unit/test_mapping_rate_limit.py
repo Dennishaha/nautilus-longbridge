@@ -21,8 +21,11 @@ def test_decimal_price_preserves_requested_precision() -> None:
 def test_aggressor_mapping() -> None:
     from longbridge import openapi
 
-    assert aggressor_side(openapi.TradeDirection.Up).name == "BUY"
-    assert aggressor_side(openapi.TradeDirection.Down).name == "SELL"
+    assert aggressor_side(openapi.TradeDirection.Up).name == "NO_AGGRESSOR"
+    assert aggressor_side(openapi.TradeDirection.Down).name == "NO_AGGRESSOR"
+    assert aggressor_side(openapi.TradeDirection.Neutral).name == "NO_AGGRESSOR"
+    assert aggressor_side("Buy").name == "BUY"
+    assert aggressor_side("Sell").name == "SELL"
 
 
 def test_rate_limiter_enforces_window() -> None:

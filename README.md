@@ -6,7 +6,7 @@
 - `nautilus_trader==2.0.0rc7`
 - `longbridge==5.2.2`
 
-当前连接器版本：`0.1.5`（测试版，不声明生产级稳定性）。
+当前连接器版本：`0.1.7`（测试版，不声明生产级稳定性）。
 
 ## 安装
 
@@ -198,6 +198,21 @@ Catalog 路径应由一个采集进程写入。项目默认忽略 `data/` 下的
   稳定合成 ID，并继续经过同一去重集合。
 - 适配器只通过 NautilusTrader client output API 发送事件，不直接修改 cache 或 engine。
 
+## NT rc7 标准接口覆盖（0.1.7）
+
+行情客户端已覆盖 rc7 的标准 Instrument、Instruments、Quote、Trade、Bar、L2 book
+snapshot、book depth 和 book deltas 请求，以及对应的订阅/取消订阅路径。Longbridge
+只提供 L2 price-level depth；L3 MBO、custom data、funding、index、mark、期权和
+instrument status/close 请求会明确返回不支持错误。Book deltas 由一次 L2 快照转换为
+带 `CLEAR`/`ADD`/`LAST` 标志的 NT `OrderBookDeltas`，不能解释为供应商原生增量流。
+
+执行客户端已覆盖下单、改单、撤单、批量撤单、账户查询、订单查询、订单状态/成交/持仓
+报告生成，以及连接和重连后的订单、成交、持仓、账户 reconciliation。Longbridge order
+list/contingent orders 仍显式拒绝；成交接口没有佣金和流动性方向字段，因此报告保留结构性
+零费用与 `NO_LIQUIDITY_SIDE`，不能据此认定真实费用为零。Instrument 的价格 increment
+默认来自连接器配置并在 metadata 标明未由供应商静态资料确认，实际研究和执行前应按市场
+规格覆盖配置。
+
 ## 开发与验证
 
 ```bash
@@ -227,9 +242,25 @@ rg -n --hidden -g '!*.pyc' -g '!.git/**' '(LONGBRIDGE_APP_SECRET|LONGBRIDGE_ACCE
 
 ## 兼容策略
 
+### 逐笔与报价语义修正（2026-10-25）
+
+Longbridge 的 `TradeDirection.Up/Down` 是相对上一笔成交价的涨跌，并不认证主动买卖方，
+现映射为 NT `NO_AGGRESSOR`，不能拿它计算主动买卖量差/CVD。此前已保存逐笔对象保留原值，需视作旧语义证据。
+依据：[官方 trades 字段说明](https://open.longbridge.com/docs/cli/market-data/trades)。
+单独请求或订阅逐笔/报价时也会确保真实 Instrument 经连接器送入 NT，避免依赖先请求K线才能填充 Cache。
+原生 `request_instrument` 也支持从静态资料发布真实合约；供应商未返回该合约时明确失败，不构造占位合约。
+
+配置 `historical_evidence_dir` 后，`request_quotes` 在转换前记录SDK返回的报价 / 深度选定字段，
+保存在 `quotes-<request-id>/manifest.json`，包括空价格、零量、空响应、请求失败类型及实际NT报价行数。
+这不是原始网络报文或实时流录制；目录不包含凭证或供应商异常消息。合法性转换规则不因留档而放宽。
+
+现有 TradeId 来自时间/价格/数量/方向/类型的内容摘要，不是交易所唯一成交号；同秒同价同量可能是不同成交。
+实时去重未利用供应商 sequence，不能声明完整逐笔流。NT Tick 未携带供应商成交条件及 sequence，盘口本地接收时间也不是交易所/NBBO时间。
+这些限制须由采集审计保留；不能因 Tick 能写入 Catalog 就认证逐笔数据的完整性。
+
 适配器以本机验证的 NautilusTrader `2.0.0rc7` 行为为准。升级到正式 v2 或其他 rc 版本时，先重新运行 Factory 注册 smoke、配置构造、typed response 和 report 构造测试，再调整依赖范围。
 
-## ORB execution support (0.1.3)
+## Market data and paper execution support (0.1.3)
 
 `LongbridgeDataClientConfig(completed_bars_only=True, max_depth_age_secs=2)` can
 forward only confirmed candles and reject stale BBO. Depth callbacks now produce
@@ -281,8 +312,7 @@ Execution reports are emitted before partial-cancel terminal events. If the
 execution endpoint lags the order status, terminal delivery waits for a later
 reconciliation rather than discarding residual fills. SDK Execution has no normal
 commission field; consumers must reconcile order `charge_detail` and cannot treat
-missing fees as zero. These changes support the separate strategy-lab ORB paper
-supervisor; this connector still has no native stop-order implementation.
+missing fees as zero. This connector still has no native stop-order implementation.
 
 SDK naive output datetimes are OS-local (`datetime.fromtimestamp(..., None)`),
 not UTC wall-clock values. Conversion now preserves that instant before converting

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from longbridge import openapi
@@ -8,6 +9,7 @@ from tests.fixtures.fakes import FakeContextFactory
 
 from nautilus_longbridge.config import LongbridgeDataClientConfig
 from nautilus_longbridge.data import LongbridgeDataClient
+from nautilus_longbridge.instruments import LongbridgeInstrumentProvider
 from nautilus_longbridge.rate_limit import ConcurrencyLimiter, SlidingWindowRateLimiter
 from nautilus_longbridge.symbols import instrument_id_from_symbol
 
@@ -38,13 +40,40 @@ async def test_quote_command_updates_desired_state() -> None:
     client._quote = factory.quote_context
     client._desired_quotes = set()
     client._desired_depth = set()
+    client._quote.static_info = AsyncMock(return_value=[SimpleNamespace(symbol="700.HK", currency="HKD", lot_size=100)])
+    client.instrument_provider = LongbridgeInstrumentProvider()
+    client.instrument_provider.set_quote_context(client._quote)
+    instruments = []
+    client._handle_instrument = instruments.append
     command = SimpleNamespace(instrument_id=instrument_id_from_symbol("700.HK"))
 
     await client._subscribe_quotes(command)
 
     assert client._desired_quotes == {"700.HK"}
     assert client._desired_depth == {"700.HK"}
+    assert len(instruments) == 1 and str(instruments[0].id) == "700.HK.LONGBRIDGE"
     assert factory.quote_context.subscription_calls
+
+
+@pytest.mark.asyncio
+async def test_explicit_instrument_request_publishes_real_definition_and_rejects_missing() -> None:
+    factory = FakeContextFactory()
+    client = object.__new__(LongbridgeDataClient)
+    client.instrument_provider = LongbridgeInstrumentProvider()
+    factory.quote_context.static_info = AsyncMock(return_value=[
+        SimpleNamespace(symbol="AAPL.US", currency="USD", lot_size=1)
+    ])
+    client.instrument_provider.set_quote_context(factory.quote_context)
+    instruments = []
+    client._handle_instrument = instruments.append
+    request = SimpleNamespace(instrument_id=instrument_id_from_symbol("AAPL.US"))
+    await client._request_instrument(request)
+    assert len(instruments) == 1 and instruments[0].id == request.instrument_id
+    factory.quote_context.static_info.assert_awaited_once_with(["AAPL.US"])
+    factory.quote_context.static_info.return_value = []
+    with pytest.raises(ValueError, match="no instrument"):
+        await client._request_instrument(SimpleNamespace(instrument_id=instrument_id_from_symbol("NVDA.US")))
+    assert len(instruments) == 1
 
 
 @pytest.mark.asyncio

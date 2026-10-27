@@ -68,3 +68,29 @@ def test_non_secret_settings_load_from_environment(monkeypatch: pytest.MonkeyPat
     assert config.settings.region == "cn"
     assert config.settings.request_timeout_secs == 7.5
     assert config.settings.dry_run is False
+
+
+def test_night_flag_reaches_sdk_and_account_reads_remain_opt_in(monkeypatch):
+    from longbridge import openapi
+
+    from nautilus_longbridge.config import build_sdk_config
+
+    monkeypatch.setenv("LONGBRIDGE_ENABLE_OVERNIGHT", "true")
+    monkeypatch.setenv("LONGBRIDGE_APP_KEY", "key")
+    monkeypatch.setenv("LONGBRIDGE_APP_SECRET", "secret")
+    monkeypatch.setenv("LONGBRIDGE_ACCESS_TOKEN", "token")
+    captured = {}
+
+    class Config:
+        @staticmethod
+        def from_apikey(*args, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+    monkeypatch.setattr(openapi, "Config", Config)
+    config = LongbridgeDataClientConfig(live_trade_sessions="All")
+    build_sdk_config(config.settings)
+    assert captured["enable_overnight"] is True
+    assert config.dict()["live_trade_sessions"] == "All"
+    assert config.reference_account_enabled is False
+    assert not LongbridgeDataClientConfig(enable_overnight=False).settings.enable_overnight
