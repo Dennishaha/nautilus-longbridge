@@ -6,7 +6,7 @@
 - `nautilus_trader==2.0.0rc7`
 - `longbridge==5.2.2`
 
-当前连接器版本：`0.1.7`（测试版，不声明生产级稳定性）。
+当前连接器版本：`0.1.8`（测试版，不声明生产级稳定性）。
 
 ## 安装
 
@@ -174,7 +174,20 @@ Catalog 路径应由一个采集进程写入。项目默认忽略 `data/` 下的
 
 普通 Quote 推送不含 bid/ask。连接器使用 Quote 与 Depth 组合生成 `QuoteTick`；没有有效顶层买卖盘时不会伪造 QuoteTick。证券的真实 tick size 可能需要通过配置覆盖，默认值只用于第一阶段测试。
 
-第一阶段不支持期权、窝轮、CBBC、组合订单、网格订单、DCA 和其他衍生品能力。
+第一阶段不支持期权、窝轮、CBBC、组合订单、网格订单、DCA 和其他衍生品交易能力。
+
+### 全球期货元数据边界
+
+连接器已经具备把供应商返回的完整期货静态资料转换为 NT `FuturesContract` 的路径，
+并会使用合约自己的乘数、价格最小变动、币种、交易所、根合约和到期时间。缺少任一关键
+字段时会拒绝加载，绝不把股票、指数或 ETF 当作期货。
+
+当前固定依赖的 `longbridge==5.2.2` Python SDK 没有期货静态资料接口；它只公开证券
+静态资料和股票衍生品类型（期权、窝轮）。因此对 `ESZ6.US`、`ESmain.US` 等期货代码，
+适配器会明确返回“installed SDK does not expose futures static metadata”，不会生成研究
+合约或假数据。若未来官方 quote context 提供 `future_static_info(symbols)`，连接器会自动
+优先使用该接口；`nt-data-tools fetch --provider longbridge --instrument-kind futures` 的
+NT 入口已经保留，待官方 SDK 和账户权限同时具备后即可接入。
 
 ## 设计
 
@@ -198,7 +211,7 @@ Catalog 路径应由一个采集进程写入。项目默认忽略 `data/` 下的
   稳定合成 ID，并继续经过同一去重集合。
 - 适配器只通过 NautilusTrader client output API 发送事件，不直接修改 cache 或 engine。
 
-## NT rc7 标准接口覆盖（0.1.7）
+## NT rc7 标准接口覆盖（0.1.8）
 
 行情客户端已覆盖 rc7 的标准 Instrument、Instruments、Quote、Trade、Bar、L2 book
 snapshot、book depth 和 book deltas 请求，以及对应的订阅/取消订阅路径。Longbridge

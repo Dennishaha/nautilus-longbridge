@@ -58,6 +58,13 @@ from .transport import ContextFactory, LongbridgeContextFactory, QuoteContext
 logger = logging.getLogger(__name__)
 
 
+def _client_price_precision(client: Any, symbol: str) -> int:
+    method = getattr(client, "_price_precision", None)
+    if callable(method):
+        return int(method(symbol))
+    return int(getattr(getattr(client, "_lb_config", None), "price_precision", 4))
+
+
 def _dispatch_response(client: Any, response: Any) -> None:
     """Dispatch through the connector helper while keeping adapter hooks duck-testable."""
     handler = getattr(client, "_emit_response", None)
@@ -159,6 +166,15 @@ class LongbridgeDataClient(DataClient):
 
     def _response_client_id(self) -> Any:
         return getattr(self, "client_id", ClientId("LONGBRIDGE-DATA"))
+
+    def _price_precision(self, symbol: str) -> int:
+        """Use the loaded instrument precision, with the equity fallback."""
+        provider = getattr(self, "instrument_provider", None)
+        if isinstance(provider, LongbridgeInstrumentProvider):
+            instrument = provider.find(instrument_id_from_symbol(symbol))
+            if instrument is not None:
+                return int(getattr(instrument, "price_precision", self._lb_config.price_precision))
+        return self._lb_config.price_precision
 
     @staticmethod
     def _response_request_id(request: Any) -> Any:
@@ -526,8 +542,8 @@ class LongbridgeDataClient(DataClient):
             return None
         return QuoteTick(
             instrument_id,
-            price(bid.price, self._lb_config.price_precision),
-            price(ask.price, self._lb_config.price_precision),
+            price(bid.price, _client_price_precision(self, symbol)),
+            price(ask.price, _client_price_precision(self, symbol)),
             quantity(getattr(bid, "volume", 0)),
             quantity(getattr(ask, "volume", 0)),
             ts_event,
@@ -599,7 +615,7 @@ class LongbridgeDataClient(DataClient):
             [
                 BookOrder(
                     OrderSide.BUY,
-                    price(row.price, self._lb_config.price_precision),
+                    price(row.price, _client_price_precision(self, str(instrument_id.symbol))),
                     quantity(row.volume),
                     int(row.position),
                 )
@@ -608,7 +624,7 @@ class LongbridgeDataClient(DataClient):
             [
                 BookOrder(
                     OrderSide.SELL,
-                    price(row.price, self._lb_config.price_precision),
+                    price(row.price, _client_price_precision(self, str(instrument_id.symbol))),
                     quantity(row.volume),
                     int(row.position),
                 )
@@ -657,7 +673,7 @@ class LongbridgeDataClient(DataClient):
             self._handle_data(
                 TradeTick(
                     instrument_id,
-                    price(item.price, self._lb_config.price_precision),
+                    price(item.price, _client_price_precision(self, symbol)),
                     quantity(item.volume),
                     aggressor_side(getattr(item, "direction", None)),
                     TradeId(digest),
@@ -683,10 +699,10 @@ class LongbridgeDataClient(DataClient):
             return
         bar = Bar(
             bar_type,
-            price(candle.open, self._lb_config.price_precision),
-            price(candle.high, self._lb_config.price_precision),
-            price(candle.low, self._lb_config.price_precision),
-            price(candle.close, self._lb_config.price_precision),
+            price(candle.open, _client_price_precision(self, symbol)),
+            price(candle.high, _client_price_precision(self, symbol)),
+            price(candle.low, _client_price_precision(self, symbol)),
+            price(candle.close, _client_price_precision(self, symbol)),
             quantity(candle.volume),
             ts_event,
             self.clock.timestamp_ns(),
@@ -732,12 +748,12 @@ class LongbridgeDataClient(DataClient):
             quote = self._quote
             if quote is None:
                 raise RuntimeError("quote context is not connected")
-            infos = await self._quote_call(lambda: quote.static_info([symbol]))
-            if len(infos) != 1 or str(getattr(infos[0], "symbol", "")).upper() != symbol:
+            infos = await self._quote_call(lambda: provider._load_static_info([symbol]))
+            if len(infos) != 1 or str(provider._field(infos[0], "symbol", "code")).upper() != symbol:
                 raise ConfigurationError(
                     f"Longbridge static_info returned no unique instrument for {symbol}"
                 )
-            referenced = provider._to_equity(infos[0], reference=reference)
+            referenced = provider._to_instrument(infos[0], reference=reference)
             self._handle_instrument(referenced)
             _dispatch_response(self,
                 InstrumentResponse(
@@ -986,7 +1002,7 @@ class LongbridgeDataClient(DataClient):
             data.append(
                 TradeTick(
                     request.instrument_id,
-                    price(item.price, self._lb_config.price_precision),
+                    price(item.price, _client_price_precision(self, symbol)),
                     quantity(item.volume),
                     aggressor_side(getattr(item, "direction", None)),
                     TradeId(digest),
@@ -1071,10 +1087,10 @@ class LongbridgeDataClient(DataClient):
                 data.append(
                     Bar(
                         request.bar_type,
-                        price(candle.open, self._lb_config.price_precision),
-                        price(candle.high, self._lb_config.price_precision),
-                        price(candle.low, self._lb_config.price_precision),
-                        price(candle.close, self._lb_config.price_precision),
+                        price(candle.open, _client_price_precision(self, symbol)),
+                        price(candle.high, _client_price_precision(self, symbol)),
+                        price(candle.low, _client_price_precision(self, symbol)),
+                        price(candle.close, _client_price_precision(self, symbol)),
                         quantity(candle.volume),
                         ts_event,
                         ts_init,

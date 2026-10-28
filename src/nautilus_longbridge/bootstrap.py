@@ -14,3 +14,11 @@ def load_env(path: Path) -> None:
             if len(values) > 1:
                 raise ValueError("invalid Longbridge environment value")
             os.environ[key.strip()] = values[0] if values else ""
+
+    # The native SDK uses reqwest for the HTTP-backed quote APIs. It reads the
+    # standard proxy variables, while this connector keeps proxy configuration
+    # under the Longbridge namespace so NT jobs can load it from --env-file.
+    proxy = os.environ.get("LONGBRIDGE_HTTP_PROXY", "").strip()
+    if proxy:
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            os.environ[name] = proxy

@@ -94,3 +94,53 @@ def test_night_flag_reaches_sdk_and_account_reads_remain_opt_in(monkeypatch):
     assert config.dict()["live_trade_sessions"] == "All"
     assert config.reference_account_enabled is False
     assert not LongbridgeDataClientConfig(enable_overnight=False).settings.enable_overnight
+
+
+def test_http_quote_transport_and_proxy_reach_sdk(monkeypatch):
+    from longbridge import openapi
+
+    from nautilus_longbridge.config import build_sdk_config
+
+    monkeypatch.setenv("LONGBRIDGE_APP_KEY", "key")
+    monkeypatch.setenv("LONGBRIDGE_APP_SECRET", "secret")
+    monkeypatch.setenv("LONGBRIDGE_ACCESS_TOKEN", "token")
+    monkeypatch.setenv("LONGBRIDGE_HTTP_PROXY", "http://127.0.0.1:10808")
+    captured = {}
+
+    class Config:
+        @staticmethod
+        def from_apikey(*args, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+    monkeypatch.setattr(openapi, "Config", Config)
+    settings = LongbridgeDataClientConfig().settings
+    build_sdk_config(settings)
+    assert settings.quote_transport == "http"
+    assert settings.http_proxy == "http://127.0.0.1:10808"
+    assert captured["quote_transport"] is openapi.QuoteTransport.Http
+    assert captured["http_url"] == "https://openapi.longbridge.com"
+    assert __import__("os").environ["HTTPS_PROXY"] == "http://127.0.0.1:10808"
+
+
+def test_explicit_websocket_quote_transport_reaches_sdk(monkeypatch):
+    from longbridge import openapi
+
+    from nautilus_longbridge.config import build_sdk_config
+
+    monkeypatch.setenv("LONGBRIDGE_APP_KEY", "key")
+    monkeypatch.setenv("LONGBRIDGE_APP_SECRET", "secret")
+    monkeypatch.setenv("LONGBRIDGE_ACCESS_TOKEN", "token")
+    captured = {}
+
+    class Config:
+        @staticmethod
+        def from_apikey(*args, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+    monkeypatch.setattr(openapi, "Config", Config)
+    settings = LongbridgeDataClientConfig(quote_transport="ws").settings
+    build_sdk_config(settings)
+    assert settings.quote_transport == "ws"
+    assert captured["quote_transport"] is openapi.QuoteTransport.WebSocket

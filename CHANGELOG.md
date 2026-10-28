@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.8 — 2026-10-28
+
+### Connector boundary and transport fixes
+
+- Keep research-universe classification and execution-audit state out of the
+  Longbridge adapter; require futures asset classes from provider metadata and
+  leave quality and certification decisions to NT data manifests.
+- Use each loaded instrument's price precision for quote, trade, book and bar
+  conversion, and expose explicit HTTP/WebSocket quote transport and proxy
+  settings.
+- Resolve optional transport configuration as a concrete string so the full
+  connector type check remains clean.
+
+### Validation
+
+- 125 connector tests pass locally on Python 3.14 with NautilusTrader
+  2.0.0rc7 and Longbridge 5.2.2; Ruff and mypy pass.
+
 ## 0.1.7 — 2026-10-27
 
 ### NautilusTrader rc7 standard coverage

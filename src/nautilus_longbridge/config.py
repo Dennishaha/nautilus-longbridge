@@ -51,6 +51,12 @@ def _explicit_or_env(name: str, value: str | None) -> str | None:
     return value if value is not None else _env_text(name)
 
 
+def _quote_transport(value: str | None) -> str:
+    if value is not None:
+        return value
+    return _env_text("LONGBRIDGE_QUOTE_TRANSPORT", "http") or "http"
+
+
 def _safe(value: Any) -> Any:
     if hasattr(value, "name"):
         return value.name
@@ -65,8 +71,10 @@ class LongbridgeSafeSettings:
     paper_trading: bool = True
     dry_run: bool = True
     http_url: str | None = None
+    http_proxy: str | None = None
     quote_ws_url: str | None = None
     trade_ws_url: str | None = None
+    quote_transport: str = "http"
     request_timeout_secs: float = 15.0
     reconnect_initial_secs: float = 1.0
     reconnect_max_secs: float = 30.0
@@ -77,6 +85,8 @@ class LongbridgeSafeSettings:
     def validate(self) -> None:
         if self.region not in {"cn", "hk"}:
             raise ConfigurationError("region must be 'cn' or 'hk'")
+        if self.quote_transport not in {"http", "ws"}:
+            raise ConfigurationError("quote_transport must be 'http' or 'ws'")
         if self.request_timeout_secs <= 0:
             raise ConfigurationError("request_timeout_secs must be positive")
         if (
@@ -128,8 +138,10 @@ class LongbridgeDataClientConfig(_SafeConfigMixin, DataClientConfig):
         paper_trading: bool | None = None,
         dry_run: bool | None = None,
         http_url: str | None = None,
+        http_proxy: str | None = None,
         quote_ws_url: str | None = None,
         trade_ws_url: str | None = None,
+        quote_transport: str | None = None,
         request_timeout_secs: float | None = None,
         reconnect_initial_secs: float | None = None,
         reconnect_max_secs: float | None = None,
@@ -158,8 +170,10 @@ class LongbridgeDataClientConfig(_SafeConfigMixin, DataClientConfig):
             else paper_trading,
             dry_run=_env_bool("LONGBRIDGE_DRY_RUN", True) if dry_run is None else dry_run,
             http_url=_explicit_or_env("LONGBRIDGE_HTTP_URL", http_url),
+            http_proxy=_explicit_or_env("LONGBRIDGE_HTTP_PROXY", http_proxy),
             quote_ws_url=_explicit_or_env("LONGBRIDGE_QUOTE_WS_URL", quote_ws_url),
             trade_ws_url=_explicit_or_env("LONGBRIDGE_TRADE_WS_URL", trade_ws_url),
+            quote_transport=_quote_transport(quote_transport),
             request_timeout_secs=(
                 _env_float("LONGBRIDGE_REQUEST_TIMEOUT_SECS", 15.0)
                 if request_timeout_secs is None
@@ -240,7 +254,9 @@ class LongbridgeExecutionClientConfig(_SafeConfigMixin, ExecutionClientConfig):
         dry_run: bool | None = None,
         http_url: str | None = None,
         quote_ws_url: str | None = None,
+        http_proxy: str | None = None,
         trade_ws_url: str | None = None,
+        quote_transport: str | None = None,
         request_timeout_secs: float | None = None,
         reconnect_initial_secs: float | None = None,
         reconnect_max_secs: float | None = None,
@@ -267,8 +283,10 @@ class LongbridgeExecutionClientConfig(_SafeConfigMixin, ExecutionClientConfig):
             else paper_trading,
             dry_run=_env_bool("LONGBRIDGE_DRY_RUN", True) if dry_run is None else dry_run,
             http_url=_explicit_or_env("LONGBRIDGE_HTTP_URL", http_url),
+            http_proxy=_explicit_or_env("LONGBRIDGE_HTTP_PROXY", http_proxy),
             quote_ws_url=_explicit_or_env("LONGBRIDGE_QUOTE_WS_URL", quote_ws_url),
             trade_ws_url=_explicit_or_env("LONGBRIDGE_TRADE_WS_URL", trade_ws_url),
+            quote_transport=_quote_transport(quote_transport),
             request_timeout_secs=(
                 _env_float("LONGBRIDGE_REQUEST_TIMEOUT_SECS", 15.0)
                 if request_timeout_secs is None
@@ -333,6 +351,9 @@ def build_sdk_config(settings: LongbridgeSafeSettings) -> Any:
         raise AuthenticationError(
             f"missing Longbridge credential environment variables: {', '.join(missing)}"
         )
+    if settings.http_proxy:
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            os.environ[name] = settings.http_proxy
     # SDK 5.2.2 exposes one official global endpoint set. Region remains a
     # validated routing label, while explicit endpoint overrides are honored.
     # Keeping the defaults here makes endpoint selection deterministic and
@@ -353,6 +374,13 @@ def build_sdk_config(settings: LongbridgeSafeSettings) -> Any:
         },
     }
     endpoint_defaults = endpoint_defaults_by_region[settings.region]
+    from longbridge import openapi
+
+    quote_transport = (
+        openapi.QuoteTransport.Http
+        if settings.quote_transport == "http"
+        else openapi.QuoteTransport.WebSocket
+    )
     return Config.from_apikey(
         os.environ[names[0]],
         os.environ[names[1]],
@@ -362,6 +390,7 @@ def build_sdk_config(settings: LongbridgeSafeSettings) -> Any:
         trade_ws_url=settings.trade_ws_url or endpoint_defaults["trade_ws_url"],
         enable_papertrading=settings.paper_trading,
         enable_overnight=settings.enable_overnight,
+        quote_transport=quote_transport,
     )
 
 
