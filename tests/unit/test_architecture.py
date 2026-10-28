@@ -13,6 +13,10 @@ def test_connector_does_not_depend_on_research_tools_or_policies():
         "ml_training",
         "RVOL",
         "nt-research-catalog-v1",
+        "historical_execution_metadata",
+        "execution_metadata_verified",
+        "research_only_until_execution_audit",
+        "KNOWN_FUTURES_ASSET_CLASSES",
     }
     for file in root.glob("*.py"):
         source = file.read_text()
