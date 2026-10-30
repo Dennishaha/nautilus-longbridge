@@ -40,18 +40,36 @@ async def test_quote_command_updates_desired_state() -> None:
     client._quote = factory.quote_context
     client._desired_quotes = set()
     client._desired_depth = set()
-    client._quote.static_info = AsyncMock(return_value=[SimpleNamespace(symbol="700.HK", currency="HKD", lot_size=100)])
+    async def static_info(symbols):
+        return [
+            SimpleNamespace(
+                symbol=symbol,
+                currency="HKD" if symbol.endswith(".HK") else "USD",
+                lot_size=100 if symbol.endswith(".HK") else 1,
+            )
+            for symbol in symbols
+        ]
+
+    client._quote.static_info = AsyncMock(side_effect=static_info)
     client.instrument_provider = LongbridgeInstrumentProvider()
     client.instrument_provider.set_quote_context(client._quote)
     instruments = []
     client._handle_instrument = instruments.append
-    command = SimpleNamespace(instrument_id=instrument_id_from_symbol("700.HK"))
+    command = SimpleNamespace(
+        instrument_ids=[
+            instrument_id_from_symbol("700.HK"),
+            instrument_id_from_symbol("AAPL.US"),
+        ]
+    )
 
     await client._subscribe_quotes(command)
 
-    assert client._desired_quotes == {"700.HK"}
-    assert client._desired_depth == {"700.HK"}
-    assert len(instruments) == 1 and str(instruments[0].id) == "700.HK.LONGBRIDGE"
+    assert client._desired_quotes == {"700.HK", "AAPL.US"}
+    assert client._desired_depth == {"700.HK", "AAPL.US"}
+    assert {str(value.id) for value in instruments} == {
+        "700.HK.LONGBRIDGE",
+        "AAPL.US.LONGBRIDGE",
+    }
     assert factory.quote_context.subscription_calls
 
 

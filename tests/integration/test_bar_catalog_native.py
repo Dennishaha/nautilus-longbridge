@@ -126,12 +126,9 @@ def test_native_node_promotes_completed_bars_and_instruments(tmp_path, periodic)
     assert [str(i.id) for i in catalog.instruments()] == ["700.HK.LONGBRIDGE"]
     assert list(tmp_path.glob("data/bars/**/*.parquet"))
     assert list(tmp_path.glob("live/**/*.feather"))
-    # rc7 rejects manual replay of an already-promoted source, preserving rows.
+    # rc8 makes promotion idempotent for an already-promoted source.
     for instance_id in catalog.list_live_runs():
-        with pytest.raises(OSError, match="non-disjoint"):
-            catalog.convert_stream_to_data(
-                instance_id, NautilusDataType.Bar, environment=Environment.LIVE
-            )
+        catalog.convert_stream_to_data(instance_id, NautilusDataType.Bar, environment=Environment.LIVE)
     assert len(catalog.query_bars()) == 3
 
 

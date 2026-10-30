@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nautilus-longbridge"
-version = "0.1.8"
+version = "0.1.9"
 description = "NautilusTrader v2 Longbridge OpenAPI connector"
 readme = "README.md"
 requires-python = ">=3.13,<3.15"
 license = { file = "LICENSE" }
 authors = [{ name = "Dennishaha" }]
 dependencies = [
-    "nautilus_trader==2.0.0rc7",
+    "nautilus_trader==2.0.0rc8",
     "longbridge==5.2.2",
 ]
 

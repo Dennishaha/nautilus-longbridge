@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.9 — 2026-10-30
+
+### NautilusTrader rc8 compatibility
+
+- Bind the connector to `nautilus_trader==2.0.0rc8`.
+- Handle rc8 batched instrument, quote, trade, book and bar subscription commands while preserving per-symbol and per-period provider leases.
+- Update native Catalog promotion coverage for rc8's idempotent replay behavior.
+
+### Validation
+
+- Full connector pytest, Ruff and mypy pass locally on Python 3.14 with NautilusTrader 2.0.0rc8 and Longbridge 5.2.2.
+
 ## 0.1.8 — 2026-10-28
 
 ### Connector boundary and transport fixes
