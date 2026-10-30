@@ -58,6 +58,26 @@ from .transport import ContextFactory, LongbridgeContextFactory, QuoteContext
 logger = logging.getLogger(__name__)
 
 
+def _command_values(command: Any, plural: str, singular: str) -> tuple[Any, ...]:
+    """Return rc8 batch fields while retaining compatibility with rc7 test doubles."""
+    values = getattr(command, plural, None)
+    if values is not None:
+        return tuple(values)
+    value = getattr(command, singular, None)
+    return (value,) if value is not None else ()
+
+
+class _RequestView:
+    """Expose one member of an rc8 batch request to a single-item request path."""
+
+    def __init__(self, request: Any, **values: Any) -> None:
+        self._request = request
+        self.__dict__.update(values)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._request, name)
+
+
 def _client_price_precision(client: Any, symbol: str) -> int:
     method = getattr(client, "_price_precision", None)
     if callable(method):
@@ -722,6 +742,13 @@ class LongbridgeDataClient(DataClient):
         self._handle_data(bar)
 
     async def _request_instrument(self, request: Any) -> None:
+        for instrument_id_value in _command_values(request, "instrument_ids", "instrument_id"):
+            await LongbridgeDataClient._request_instrument_one(
+                self,
+                _RequestView(request, instrument_id=instrument_id_value)
+            )
+
+    async def _request_instrument_one(self, request: Any) -> None:
         provider = self.instrument_provider
         if not isinstance(provider, LongbridgeInstrumentProvider):
             raise ValueError("Longbridge instrument provider required")
@@ -819,12 +846,13 @@ class LongbridgeDataClient(DataClient):
     async def _subscribe_instrument(self, command: Any) -> None:
         if not isinstance(self.instrument_provider, LongbridgeInstrumentProvider):
             raise ConfigurationError("Longbridge instrument provider required")
-        symbol = symbol_from_instrument_id(command.instrument_id)
-        await self.instrument_provider.load_symbols_async([symbol])
-        instrument = self.instrument_provider.find(command.instrument_id)
-        if instrument is None:
-            raise ConfigurationError(f"Longbridge returned no instrument for {symbol}")
-        self._handle_instrument(instrument)
+        for instrument_id_value in _command_values(command, "instrument_ids", "instrument_id"):
+            symbol = symbol_from_instrument_id(instrument_id_value)
+            await self.instrument_provider.load_symbols_async([symbol])
+            instrument = self.instrument_provider.find(instrument_id_value)
+            if instrument is None:
+                raise ConfigurationError(f"Longbridge returned no instrument for {symbol}")
+            self._handle_instrument(instrument)
 
     async def _subscribe_instruments(self, command: Any) -> None:
         for value in await self._load_instrument_params(getattr(command, "params", None)):
@@ -857,80 +885,105 @@ class LongbridgeDataClient(DataClient):
         return instrument_id
 
     async def _subscribe_quotes(self, command: Any) -> None:
-        symbol = symbol_from_instrument_id(command.instrument_id)
-        self._desired_quotes.add(symbol)
-        self._desired_depth.add(symbol)
-        quote = self._quote
-        if quote is not None:
-            await self._ensure_instrument(symbol)
-            from longbridge.openapi import SubType
+        for instrument_id_value in _command_values(command, "instrument_ids", "instrument_id"):
+            symbol = symbol_from_instrument_id(instrument_id_value)
+            self._desired_quotes.add(symbol)
+            self._desired_depth.add(symbol)
+            quote = self._quote
+            if quote is not None:
+                await self._ensure_instrument(symbol)
+                from longbridge.openapi import SubType
 
-            await self._quote_call(
-                lambda: quote.subscribe([symbol], [SubType.Quote, SubType.Depth])
-            )
-
-    async def _unsubscribe_quotes(self, command: Any) -> None:
-        symbol = symbol_from_instrument_id(command.instrument_id)
-        self._desired_quotes.discard(symbol)
-        if (
-            symbol not in getattr(self, "_desired_book_depth", {})
-            and symbol not in getattr(self, "_desired_book_deltas", set())
-        ):
-            self._desired_depth.discard(symbol)
-        quote = self._quote
-        if quote is not None:
-            from longbridge.openapi import SubType
-            if symbol in getattr(self, "_desired_book_depth", {}) or symbol in getattr(
-                self, "_desired_book_deltas", set()
-            ):
-                await self._quote_call(lambda: quote.unsubscribe([symbol], [SubType.Quote]))
-            else:
                 await self._quote_call(
-                    lambda: quote.unsubscribe([symbol], [SubType.Quote, SubType.Depth])
+                    partial(quote.subscribe, [symbol], [SubType.Quote, SubType.Depth])
                 )
 
-    async def _subscribe_trades(self, command: Any) -> None:
-        symbol = symbol_from_instrument_id(command.instrument_id)
-        self._desired_trades.add(symbol)
-        quote = self._quote
-        if quote is not None:
-            await self._ensure_instrument(symbol)
-            from longbridge.openapi import SubType
+    async def _unsubscribe_quotes(self, command: Any) -> None:
+        for instrument_id_value in _command_values(command, "instrument_ids", "instrument_id"):
+            symbol = symbol_from_instrument_id(instrument_id_value)
+            self._desired_quotes.discard(symbol)
+            if (
+                symbol not in getattr(self, "_desired_book_depth", {})
+                and symbol not in getattr(self, "_desired_book_deltas", set())
+            ):
+                self._desired_depth.discard(symbol)
+            quote = self._quote
+            if quote is not None:
+                from longbridge.openapi import SubType
+                if symbol in getattr(self, "_desired_book_depth", {}) or symbol in getattr(
+                    self, "_desired_book_deltas", set()
+                ):
+                    await self._quote_call(
+                        partial(quote.unsubscribe, [symbol], [SubType.Quote])
+                    )
+                else:
+                    await self._quote_call(
+                        partial(quote.unsubscribe, [symbol], [SubType.Quote, SubType.Depth])
+                    )
 
-            await self._quote_call(lambda: quote.subscribe([symbol], [SubType.Trade]))
+    async def _subscribe_trades(self, command: Any) -> None:
+        for instrument_id_value in _command_values(command, "instrument_ids", "instrument_id"):
+            symbol = symbol_from_instrument_id(instrument_id_value)
+            self._desired_trades.add(symbol)
+            quote = self._quote
+            if quote is not None:
+                await self._ensure_instrument(symbol)
+                from longbridge.openapi import SubType
+
+                await self._quote_call(
+                    partial(quote.subscribe, [symbol], [SubType.Trade])
+                )
 
     async def _unsubscribe_trades(self, command: Any) -> None:
-        symbol = symbol_from_instrument_id(command.instrument_id)
-        self._desired_trades.discard(symbol)
-        quote = self._quote
-        if quote is not None:
-            from longbridge.openapi import SubType
+        for instrument_id_value in _command_values(command, "instrument_ids", "instrument_id"):
+            symbol = symbol_from_instrument_id(instrument_id_value)
+            self._desired_trades.discard(symbol)
+            quote = self._quote
+            if quote is not None:
+                from longbridge.openapi import SubType
 
-            await self._quote_call(lambda: quote.unsubscribe([symbol], [SubType.Trade]))
+                await self._quote_call(
+                    partial(quote.unsubscribe, [symbol], [SubType.Trade])
+                )
 
     async def _subscribe_bars(self, command: Any) -> None:
-        symbol = symbol_from_instrument_id(command.bar_type.instrument_id)
-        period = _period_for_bar_type(command.bar_type)
-        self._desired_bars[(symbol, str(period))] = period
-        quote = self._quote
-        if quote is not None:
-            from longbridge.openapi import TradeSessions
+        for bar_type in _command_values(command, "bar_types", "bar_type"):
+            symbol = symbol_from_instrument_id(bar_type.instrument_id)
+            period = _period_for_bar_type(bar_type)
+            self._desired_bars[(symbol, str(period))] = period
+            quote = self._quote
+            if quote is not None:
+                from longbridge.openapi import TradeSessions
 
-            await self._ensure_instrument(symbol)
-            await self._quote_call(
-                lambda: quote.subscribe_candlesticks(symbol, period,
-                                                     getattr(TradeSessions, self._lb_config.live_trade_sessions))
-            )
+                await self._ensure_instrument(symbol)
+                await self._quote_call(
+                    partial(
+                        quote.subscribe_candlesticks,
+                        symbol,
+                        period,
+                        getattr(TradeSessions, self._lb_config.live_trade_sessions),
+                    )
+                )
 
     async def _unsubscribe_bars(self, command: Any) -> None:
-        symbol = symbol_from_instrument_id(command.bar_type.instrument_id)
-        period = _period_for_bar_type(command.bar_type)
-        subscribed = self._desired_bars.pop((symbol, str(period)), None)
-        quote = self._quote
-        if quote is not None and subscribed is not None:
-            await self._quote_call(lambda: quote.unsubscribe_candlesticks(symbol, period))
+        for bar_type in _command_values(command, "bar_types", "bar_type"):
+            symbol = symbol_from_instrument_id(bar_type.instrument_id)
+            period = _period_for_bar_type(bar_type)
+            subscribed = self._desired_bars.pop((symbol, str(period)), None)
+            quote = self._quote
+            if quote is not None and subscribed is not None:
+                await self._quote_call(
+                    partial(quote.unsubscribe_candlesticks, symbol, period)
+                )
 
     async def _request_quotes(self, request: Any) -> None:
+        for instrument_id_value in _command_values(request, "instrument_ids", "instrument_id"):
+            await LongbridgeDataClient._request_quotes_one(
+                self,
+                _RequestView(request, instrument_id=instrument_id_value)
+            )
+
+    async def _request_quotes_one(self, request: Any) -> None:
         quote = self._quote
         if quote is None:
             return
@@ -984,6 +1037,13 @@ class LongbridgeDataClient(DataClient):
         )
 
     async def _request_trades(self, request: Any) -> None:
+        for instrument_id_value in _command_values(request, "instrument_ids", "instrument_id"):
+            await LongbridgeDataClient._request_trades_one(
+                self,
+                _RequestView(request, instrument_id=instrument_id_value)
+            )
+
+    async def _request_trades_one(self, request: Any) -> None:
         quote = self._quote
         if quote is None:
             return
@@ -1028,6 +1088,12 @@ class LongbridgeDataClient(DataClient):
         )
 
     async def _request_bars(self, request: Any) -> None:
+        for bar_type in _command_values(request, "bar_types", "bar_type"):
+            await LongbridgeDataClient._request_bars_one(
+                self, _RequestView(request, bar_type=bar_type)
+            )
+
+    async def _request_bars_one(self, request: Any) -> None:
         quote = self._quote
         if quote is None:
             return
@@ -1103,7 +1169,7 @@ class LongbridgeDataClient(DataClient):
                     data,
                     getattr(request, "request_id", UUID4()),
                     self.clock.timestamp_ns(),
-                    # The adapter has already filtered by ts_event. rc7's
+                    # The adapter has already filtered by ts_event. rc8's
                     # response bounds trim by ts_init and would drop fetched
                     # history whose real receipt time is later than the range.
                     None,
@@ -1119,6 +1185,13 @@ class LongbridgeDataClient(DataClient):
                 evidence.finish()
 
     async def _request_book_snapshot(self, request: Any) -> None:
+        for instrument_id_value in _command_values(request, "instrument_ids", "instrument_id"):
+            await LongbridgeDataClient._request_book_snapshot_one(
+                self,
+                _RequestView(request, instrument_id=instrument_id_value)
+            )
+
+    async def _request_book_snapshot_one(self, request: Any) -> None:
         quote = self._quote
         if quote is None:
             return
@@ -1147,6 +1220,13 @@ class LongbridgeDataClient(DataClient):
             raise UnsupportedOperation("Longbridge provides L2 price-level depth, not L3 MBO")
 
     async def _request_book_depth(self, request: Any) -> None:
+        for instrument_id_value in _command_values(request, "instrument_ids", "instrument_id"):
+            await LongbridgeDataClient._request_book_depth_one(
+                self,
+                _RequestView(request, instrument_id=instrument_id_value)
+            )
+
+    async def _request_book_depth_one(self, request: Any) -> None:
         quote = self._quote
         if quote is None:
             return
@@ -1171,6 +1251,13 @@ class LongbridgeDataClient(DataClient):
         )
 
     async def _request_book_deltas(self, request: Any) -> None:
+        for instrument_id_value in _command_values(request, "instrument_ids", "instrument_id"):
+            await LongbridgeDataClient._request_book_deltas_one(
+                self,
+                _RequestView(request, instrument_id=instrument_id_value)
+            )
+
+    async def _request_book_deltas_one(self, request: Any) -> None:
         quote = self._quote
         if quote is None:
             return
@@ -1196,33 +1283,37 @@ class LongbridgeDataClient(DataClient):
 
     async def _subscribe_book_depth(self, command: Any) -> None:
         self._check_book_type(command)
-        symbol = symbol_from_instrument_id(command.instrument_id)
         if not hasattr(self, "_desired_book_depth"):
             self._desired_book_depth = {}
         if not hasattr(self, "_desired_book_deltas"):
             self._desired_book_deltas = set()
-        self._desired_book_depth[symbol] = getattr(command, "depth", None) or 10
-        self._desired_depth.add(symbol)
-        await self._subscribe_depth_only(symbol)
+        for instrument_id_value in _command_values(command, "instrument_ids", "instrument_id"):
+            symbol = symbol_from_instrument_id(instrument_id_value)
+            self._desired_book_depth[symbol] = getattr(command, "depth", None) or 10
+            self._desired_depth.add(symbol)
+            await self._subscribe_depth_only(symbol)
 
     async def _unsubscribe_book_depth(self, command: Any) -> None:
-        symbol = symbol_from_instrument_id(command.instrument_id)
-        getattr(self, "_desired_book_depth", {}).pop(symbol, None)
-        await self._maybe_unsubscribe_depth(symbol)
+        for instrument_id_value in _command_values(command, "instrument_ids", "instrument_id"):
+            symbol = symbol_from_instrument_id(instrument_id_value)
+            getattr(self, "_desired_book_depth", {}).pop(symbol, None)
+            await self._maybe_unsubscribe_depth(symbol)
 
     async def _subscribe_book_deltas(self, command: Any) -> None:
         self._check_book_type(command)
-        symbol = symbol_from_instrument_id(command.instrument_id)
         if not hasattr(self, "_desired_book_deltas"):
             self._desired_book_deltas = set()
-        self._desired_book_deltas.add(symbol)
-        self._desired_depth.add(symbol)
-        await self._subscribe_depth_only(symbol)
+        for instrument_id_value in _command_values(command, "instrument_ids", "instrument_id"):
+            symbol = symbol_from_instrument_id(instrument_id_value)
+            self._desired_book_deltas.add(symbol)
+            self._desired_depth.add(symbol)
+            await self._subscribe_depth_only(symbol)
 
     async def _unsubscribe_book_deltas(self, command: Any) -> None:
-        symbol = symbol_from_instrument_id(command.instrument_id)
-        getattr(self, "_desired_book_deltas", set()).discard(symbol)
-        await self._maybe_unsubscribe_depth(symbol)
+        for instrument_id_value in _command_values(command, "instrument_ids", "instrument_id"):
+            symbol = symbol_from_instrument_id(instrument_id_value)
+            getattr(self, "_desired_book_deltas", set()).discard(symbol)
+            await self._maybe_unsubscribe_depth(symbol)
 
     async def _subscribe_depth_only(self, symbol: str) -> None:
         quote = self._quote

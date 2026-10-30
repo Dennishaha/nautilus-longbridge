@@ -3,10 +3,10 @@
 独立的 NautilusTrader v2 Longbridge OpenAPI 连接器。当前版本面向测试和纸面交易验证，固定绑定：
 
 - Python 3.13/3.14
-- `nautilus_trader==2.0.0rc7`
+- `nautilus_trader==2.0.0rc8`
 - `longbridge==5.2.2`
 
-当前连接器版本：`0.1.8`（测试版，不声明生产级稳定性）。
+当前连接器版本：`0.1.9`（测试版，不声明生产级稳定性）。
 
 ## 安装
 
@@ -95,7 +95,7 @@ node = builder.build()
 
 ## K 线落盘：Parquet Data Catalog
 
-实时采集使用 NT rc7 的原生链路：`LongbridgeDataClient -> DataEngine -> StreamingConfig ->
+实时采集使用 NT rc8 的原生链路：`LongbridgeDataClient -> DataEngine -> StreamingConfig ->
 Feather 暂存 -> ParquetDataCatalog`。配置入口：
 
 ```python
@@ -153,7 +153,7 @@ bars = catalog.query_bars(identifiers=["AAPL.US.LONGBRIDGE-1-MINUTE-LAST-EXTERNA
 Parquet 位于 `data/catalog/data/bars/<BarType>/`，原始暂存文件保留在
 `data/catalog/live/<instance_id>/`。对尚未提交的 Bar 暂存文件，可使用 NT 的
 `catalog.convert_stream_to_data(instance_id, NautilusDataType.Bar, environment=Environment.LIVE)`
-恢复该次运行（`NautilusDataType` 从 `nautilus_trader.model` 导入）。本项目绑定的 rc7 对
+恢复该次运行（`NautilusDataType` 从 `nautilus_trader.model` 导入）。本项目绑定的 rc8 对
 手动重复转换已提交的暂存文件会报告区间重叠，应先核对现有 Catalog，保留原始暂存文件。
 不同进程重新收到的相同业务 K 线不会
 自动跨运行去重，历史下载及重启期间的缺口也不会由这个实时采集入口自动回补。
@@ -206,14 +206,14 @@ NT 入口已经保留，待官方 SDK 和账户权限同时具备后即可接入
 - 下单数量按 instrument 的 Longbridge board lot 校验；港股非法手数在本地拒绝。
 - 提交超时或响应缺少 venue order ID 时保持 `SUBMITTED`，通过稳定 `remark` 查询对账，禁止自动重复下单。
 - 撤单后轮询终态确认；订单和成交报告优先使用 instrument 的价格精度。
-- 启动 reconciliation 查询订单、成交、持仓和账户资金，并通过 rc7 的 typed reports 送入核心。
+- 启动 reconciliation 查询订单、成交、持仓和账户资金，并通过 rc8 的 typed reports 送入核心。
 - 成交没有 `execution_id`/`trade_id` 时使用订单、标的、价格、数量、方向和成交时间生成
   稳定合成 ID，并继续经过同一去重集合。
 - 适配器只通过 NautilusTrader client output API 发送事件，不直接修改 cache 或 engine。
 
-## NT rc7 标准接口覆盖（0.1.8）
+## NT rc8 标准接口覆盖（0.1.9）
 
-行情客户端已覆盖 rc7 的标准 Instrument、Instruments、Quote、Trade、Bar、L2 book
+行情客户端已覆盖 rc8 的标准 Instrument、Instruments、Quote、Trade、Bar、L2 book
 snapshot、book depth 和 book deltas 请求，以及对应的订阅/取消订阅路径。Longbridge
 只提供 L2 price-level depth；L3 MBO、custom data、funding、index、mark、期权和
 instrument status/close 请求会明确返回不支持错误。Book deltas 由一次 L2 快照转换为
@@ -271,7 +271,7 @@ Longbridge 的 `TradeDirection.Up/Down` 是相对上一笔成交价的涨跌，�
 实时去重未利用供应商 sequence，不能声明完整逐笔流。NT Tick 未携带供应商成交条件及 sequence，盘口本地接收时间也不是交易所/NBBO时间。
 这些限制须由采集审计保留；不能因 Tick 能写入 Catalog 就认证逐笔数据的完整性。
 
-适配器以本机验证的 NautilusTrader `2.0.0rc7` 行为为准。升级到正式 v2 或其他 rc 版本时，先重新运行 Factory 注册 smoke、配置构造、typed response 和 report 构造测试，再调整依赖范围。
+适配器以本机验证的 NautilusTrader `2.0.0rc8` 行为为准。rc8 的批量订阅命令使用 `instrument_ids` / `bar_types`，适配器逐项处理并保留每个供应商订阅的独立生命周期；Catalog 重放促销按 rc8 的幂等语义验证。升级到其他版本时，先重新运行 Factory 注册 smoke、配置构造、typed response 和 report 构造测试，再调整依赖范围。
 
 ## Market data and paper execution support (0.1.3)
 
