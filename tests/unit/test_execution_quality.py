@@ -186,6 +186,26 @@ async def test_partial_cancel_waits_for_execution_then_emits_fill_before_termina
 
 
 @pytest.mark.asyncio
+async def test_fill_report_uses_explicit_provider_commission_fields():
+    client = execution_client(FakeTradeContext())
+    report = client._fill_report(
+        SimpleNamespace(
+            order_id="123",
+            trade_id="T-1",
+            symbol="700.HK",
+            quantity=Decimal("10"),
+            price=Decimal("10.20"),
+            side="Buy",
+            commission=Decimal("1.25"),
+            commission_currency="HKD",
+            trade_done_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+    )
+    assert report.commission.as_decimal() == Decimal("1.25")
+    assert str(report.commission.currency) == "HKD"
+
+
+@pytest.mark.asyncio
 async def test_order_fee_snapshot_does_not_assume_missing_commission_is_zero():
     context = FakeTradeContext()
     client = execution_client(context)

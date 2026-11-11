@@ -1473,20 +1473,35 @@ class LongbridgeExecutionClient(ExecutionClient):
         precision = self._price_precision(instrument_id)
         provider: Any = getattr(self, "instrument_provider", None)
         instrument = provider.find(instrument_id) if provider is not None else None
-        currency = Currency.from_str(
-            str(
+        currency_text = str(
+            getattr(
+                value,
+                "currency",
+                getattr(instrument, "quote_currency", self._lb_config.base_currency),
+            )
+        ).upper()
+        currency = Currency.from_str(currency_text)
+        raw_commission = getattr(value, "commission", None)
+        if raw_commission is None:
+            raw_commission = getattr(value, "fee", None)
+        if raw_commission is None:
+            commission = Money.from_decimal(Decimal(0), currency)
+            logger.warning(
+                "Longbridge execution %s has no commission or liquidity-side fields; "
+                "emitting structural zero fee and NO_LIQUIDITY_SIDE",
+                self._execution_id(value),
+            )
+        else:
+            commission_currency = str(
                 getattr(
                     value,
-                    "currency",
-                    getattr(instrument, "quote_currency", self._lb_config.base_currency),
+                    "commission_currency",
+                    getattr(value, "fee_currency", currency_text),
                 )
             ).upper()
-        )
-        logger.warning(
-            "Longbridge execution %s has no commission or liquidity-side fields; "
-            "emitting structural zero fee and NO_LIQUIDITY_SIDE",
-            self._execution_id(value),
-        )
+            commission = Money.from_decimal(
+                as_decimal(raw_commission), Currency.from_str(commission_currency)
+            )
         return FillReport(
             AccountId(self._lb_config.account_id),
             instrument_id,
@@ -1495,7 +1510,7 @@ class LongbridgeExecutionClient(ExecutionClient):
             OrderSide.BUY if "BUY" in enum_name(value.side) else OrderSide.SELL,
             quantity(getattr(value, "quantity", getattr(value, "executed_quantity", 0))),
             price(getattr(value, "price", 0), precision),
-            Money.from_decimal(as_decimal(getattr(value, "commission", 0)), currency),
+            commission,
             LiquiditySide.NO_LIQUIDITY_SIDE,
             timestamp_ns(
                 getattr(
