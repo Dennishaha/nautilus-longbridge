@@ -144,6 +144,56 @@ async def test_submit_uses_idempotency_key_and_deduplicates_push_fills(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "submit_error",
+    [
+        ConnectionError("connection reset by peer"),
+        RuntimeError("error sending request for url https://example.invalid"),
+    ],
+    ids=["connection-reset", "wrapped-transport"],
+)
+async def test_transport_submit_errors_reconcile_without_resubmitting(
+    monkeypatch: pytest.MonkeyPatch,
+    submit_error: BaseException,
+) -> None:
+    monkeypatch.setenv("LONGBRIDGE_ENABLE_LIVE_SMOKE", "1")
+    monkeypatch.setenv("LONGBRIDGE_ENABLE_ORDER_SMOKE", "1")
+    context = FakeTradeContext()
+    context.submit_exception = submit_error
+    context.orders = [
+        SimpleNamespace(
+            order_id="456",
+            remark="NT-O-1",
+            status="New",
+            symbol="700.HK",
+            side="Buy",
+            quantity=Decimal("100"),
+            executed_quantity=Decimal("0"),
+            order_type="MO",
+            time_in_force="Day",
+            submitted_at=datetime(2026, 1, 1, tzinfo=UTC),
+            updated_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+    ]
+    client = _client(context)
+    order = _order()
+    generated: list[tuple[str, object]] = []
+    rejected: list[object] = []
+    client.generate_order_submitted = lambda value: generated.append(("submitted", value))
+    client.generate_order_accepted = lambda *args: generated.append(("accepted", args))
+    client.generate_order_rejected = lambda *args: rejected.append(args)
+
+    await client._submit_order(SimpleNamespace(order=order))
+    reconciliation = client._reconciliation_tasks["O-1"]
+    assert await reconciliation is True
+
+    assert len(context.submitted) == 1
+    assert client._venue_by_client["O-1"] == "456"
+    assert rejected == []
+    assert [kind for kind, _ in generated] == ["submitted", "accepted"]
+
+
+@pytest.mark.asyncio
 async def test_timeout_reconciles_without_resubmitting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

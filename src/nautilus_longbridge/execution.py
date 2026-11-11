@@ -78,6 +78,31 @@ def _sdk_class(name: str) -> Any:
     return getattr(openapi, name)
 
 
+def _submission_is_uncertain(exc: BaseException) -> bool:
+    """Return whether a submit failure leaves venue acceptance unknown."""
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        return True
+    kind = getattr(exc, "kind", None)
+    kind_name = getattr(kind, "__name__", "") or type(kind).__name__
+    if kind_name.lower() in {"http", "other"}:
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "error sending request",
+            "client error (connect)",
+            "connection reset",
+            "connection refused",
+            "connection aborted",
+            "server disconnected",
+            "broken pipe",
+            "incomplete read",
+            "transport closed",
+        )
+    )
+
+
 def client_request_id(client_order_id: ClientOrderId | str) -> str:
     """Return a stable, venue-safe idempotency key."""
     value = str(client_order_id)
@@ -766,7 +791,9 @@ class LongbridgeExecutionClient(ExecutionClient):
         self.generate_order_submitted(order)
         try:
             trade = self._trade
-            assert trade is not None
+            if trade is None:
+                raise ConnectionError("Longbridge trade connection unavailable at submission boundary")
+
             def submit() -> Awaitable[Any]:
                 # The rate limiter can wait after preflight. Recheck at the
                 # actual transport boundary, before any SDK submission starts.
@@ -793,14 +820,16 @@ class LongbridgeExecutionClient(ExecutionClient):
                     remark=client_request_id(order.client_order_id),
                 )
             response = await self._trade_call(submit)
-        except TimeoutError:
-            logger.error(
-                "Longbridge submit timed out for %s; keeping order submitted and reconciling",
-                order.client_order_id,
-            )
-            self._schedule_reconciliation(str(order.client_order_id))
-            return
         except Exception as exc:
+            if _submission_is_uncertain(exc):
+                logger.error(
+                    "Longbridge submit outcome is uncertain for %s (%s); keeping order "
+                    "submitted and reconciling",
+                    order.client_order_id,
+                    type(exc).__name__,
+                )
+                self._schedule_reconciliation(str(order.client_order_id))
+                return
             self._pending_orders.pop(str(order.client_order_id), None)
             self.generate_order_rejected(order, str(exc), self.clock.timestamp_ns(), False)
             return
