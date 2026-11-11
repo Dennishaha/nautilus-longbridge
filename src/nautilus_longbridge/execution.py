@@ -550,14 +550,18 @@ class LongbridgeExecutionClient(ExecutionClient):
                 })
                 if not self._client_id_for_venue(str(value.order_id)):
                     unmanaged.append(str(value.order_id))
-            elif filled > 0 and (client_id := self._client_id_for_venue(str(value.order_id))):
-                if client_id not in fees and hasattr(trade, "order_detail"):
-                    detail = await self._trade_call(partial(trade.order_detail, str(value.order_id)))
-                    charges = getattr(detail, "charge_detail", None)
-                    if charges is not None and str(charges.currency).upper() == "USD":
-                        amount = as_decimal(charges.total_amount)
-                        if amount.is_finite() and amount >= 0:
-                            fees[client_id] = float(amount)
+            elif (
+                filled > 0
+                and (client_id := self._client_id_for_venue(str(value.order_id)))
+                and client_id not in fees
+                and hasattr(trade, "order_detail")
+            ):
+                detail = await self._trade_call(partial(trade.order_detail, str(value.order_id)))
+                charges = getattr(detail, "charge_detail", None)
+                if charges is not None and str(charges.currency).upper() == "USD":
+                    amount = as_decimal(charges.total_amount)
+                    if amount.is_finite() and amount >= 0:
+                        fees[client_id] = float(amount)
         equity = as_decimal(balance.net_assets)
         cash = as_decimal(available) if available is not None else None
         if not equity.is_finite() or equity <= 0 or (
