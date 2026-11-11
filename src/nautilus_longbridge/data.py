@@ -149,6 +149,11 @@ class LongbridgeDataClient(DataClient):
         self._desired_quotes: set[str] = set()
         self._desired_trades: set[str] = set()
         self._desired_bars: dict[tuple[str, str], Any] = {}
+        self._quote_refs: dict[str, int] = {}
+        self._trade_refs: dict[str, int] = {}
+        self._bar_refs: dict[tuple[str, str], int] = {}
+        self._book_depth_refs: dict[str, int] = {}
+        self._book_delta_refs: dict[str, int] = {}
         self._last_confirmed_bars: dict[str, Bar] = {}
         self._accepting_events = False
         self._desired_depth: set[str] = set()
@@ -901,78 +906,133 @@ class LongbridgeDataClient(DataClient):
             raise ConfigurationError(f"Longbridge instrument provider is unavailable for {symbol}")
         return instrument_id
 
+    def _subscription_count(self, attr: str, key: Any, desired: bool = False) -> int:
+        counts = getattr(self, attr, None)
+        if counts is None:
+            counts = {}
+            setattr(self, attr, counts)
+        return int(counts.get(key, 1 if desired else 0))
+
+    def _set_subscription_count(self, attr: str, key: Any, count: int) -> None:
+        counts = getattr(self, attr, None)
+        if counts is None:
+            counts = {}
+            setattr(self, attr, counts)
+        if count > 0:
+            counts[key] = count
+        else:
+            counts.pop(key, None)
+
+    def _has_book_subscription(self, symbol: str) -> bool:
+        return bool(
+            self._subscription_count(
+                "_book_depth_refs", symbol, symbol in getattr(self, "_desired_book_depth", {})
+            )
+            or self._subscription_count(
+                "_book_delta_refs", symbol, symbol in getattr(self, "_desired_book_deltas", set())
+            )
+        )
+
+    def _has_depth_subscription(self, symbol: str) -> bool:
+        return bool(
+            self._subscription_count(
+                "_quote_refs", symbol, symbol in getattr(self, "_desired_quotes", set())
+            )
+            or self._has_book_subscription(symbol)
+        )
+
     async def _subscribe_quotes(self, command: Any) -> None:
         for instrument_id_value in _command_values(command, "instrument_ids", "instrument_id"):
             symbol = symbol_from_instrument_id(instrument_id_value)
+            count = self._subscription_count(
+                "_quote_refs", symbol, symbol in getattr(self, "_desired_quotes", set())
+            )
+            self._set_subscription_count("_quote_refs", symbol, count + 1)
             self._desired_quotes.add(symbol)
             self._desired_depth.add(symbol)
             quote = self._quote
-            if quote is not None:
+            if quote is not None and count == 0:
                 await self._ensure_instrument(symbol)
                 from longbridge.openapi import SubType
 
-                await self._quote_call(
-                    partial(quote.subscribe, [symbol], [SubType.Quote, SubType.Depth])
-                )
+                sub_types: list[Any] = [SubType.Quote]
+                if not self._has_book_subscription(symbol):
+                    sub_types.append(SubType.Depth)
+                await self._quote_call(partial(quote.subscribe, [symbol], sub_types))
 
     async def _unsubscribe_quotes(self, command: Any) -> None:
         for instrument_id_value in _command_values(command, "instrument_ids", "instrument_id"):
             symbol = symbol_from_instrument_id(instrument_id_value)
+            count = self._subscription_count(
+                "_quote_refs", symbol, symbol in getattr(self, "_desired_quotes", set())
+            )
+            if count <= 0:
+                continue
+            self._set_subscription_count("_quote_refs", symbol, count - 1)
+            if count > 1:
+                continue
             self._desired_quotes.discard(symbol)
             self._last_quotes.pop(symbol, None)
             if hasattr(self, "_depth_received_ns"):
                 self._depth_received_ns.pop(symbol, None)
-            if (
-                symbol not in getattr(self, "_desired_book_depth", {})
-                and symbol not in getattr(self, "_desired_book_deltas", set())
-            ):
+            if self._has_depth_subscription(symbol):
+                self._desired_depth.add(symbol)
+            else:
                 self._desired_depth.discard(symbol)
             quote = self._quote
             if quote is not None:
                 from longbridge.openapi import SubType
-                if symbol in getattr(self, "_desired_book_depth", {}) or symbol in getattr(
-                    self, "_desired_book_deltas", set()
-                ):
-                    await self._quote_call(
-                        partial(quote.unsubscribe, [symbol], [SubType.Quote])
-                    )
-                else:
-                    await self._quote_call(
-                        partial(quote.unsubscribe, [symbol], [SubType.Quote, SubType.Depth])
-                    )
+
+                sub_types: list[Any] = [SubType.Quote]
+                if not self._has_book_subscription(symbol):
+                    sub_types.append(SubType.Depth)
+                await self._quote_call(partial(quote.unsubscribe, [symbol], sub_types))
 
     async def _subscribe_trades(self, command: Any) -> None:
         for instrument_id_value in _command_values(command, "instrument_ids", "instrument_id"):
             symbol = symbol_from_instrument_id(instrument_id_value)
+            count = self._subscription_count(
+                "_trade_refs", symbol, symbol in getattr(self, "_desired_trades", set())
+            )
+            self._set_subscription_count("_trade_refs", symbol, count + 1)
             self._desired_trades.add(symbol)
             quote = self._quote
-            if quote is not None:
+            if quote is not None and count == 0:
                 await self._ensure_instrument(symbol)
                 from longbridge.openapi import SubType
 
-                await self._quote_call(
-                    partial(quote.subscribe, [symbol], [SubType.Trade])
-                )
+                await self._quote_call(partial(quote.subscribe, [symbol], [SubType.Trade]))
 
     async def _unsubscribe_trades(self, command: Any) -> None:
         for instrument_id_value in _command_values(command, "instrument_ids", "instrument_id"):
             symbol = symbol_from_instrument_id(instrument_id_value)
+            count = self._subscription_count(
+                "_trade_refs", symbol, symbol in getattr(self, "_desired_trades", set())
+            )
+            if count <= 0:
+                continue
+            self._set_subscription_count("_trade_refs", symbol, count - 1)
+            if count > 1:
+                continue
             self._desired_trades.discard(symbol)
             quote = self._quote
             if quote is not None:
                 from longbridge.openapi import SubType
 
-                await self._quote_call(
-                    partial(quote.unsubscribe, [symbol], [SubType.Trade])
-                )
+                await self._quote_call(partial(quote.unsubscribe, [symbol], [SubType.Trade]))
 
     async def _subscribe_bars(self, command: Any) -> None:
         for bar_type in _command_values(command, "bar_types", "bar_type"):
             symbol = symbol_from_instrument_id(bar_type.instrument_id)
             period = _period_for_bar_type(bar_type)
-            self._desired_bars[(symbol, str(period))] = period
+            key = (symbol, str(period))
+            count = self._subscription_count(
+                "_bar_refs", key, key in getattr(self, "_desired_bars", {})
+            )
+            self._set_subscription_count("_bar_refs", key, count + 1)
+            self._desired_bars[key] = period
             quote = self._quote
-            if quote is not None:
+            if quote is not None and count == 0:
                 from longbridge.openapi import TradeSessions
 
                 await self._ensure_instrument(symbol)
@@ -989,12 +1049,19 @@ class LongbridgeDataClient(DataClient):
         for bar_type in _command_values(command, "bar_types", "bar_type"):
             symbol = symbol_from_instrument_id(bar_type.instrument_id)
             period = _period_for_bar_type(bar_type)
-            subscribed = self._desired_bars.pop((symbol, str(period)), None)
+            key = (symbol, str(period))
+            count = self._subscription_count(
+                "_bar_refs", key, key in getattr(self, "_desired_bars", {})
+            )
+            if count <= 0:
+                continue
+            self._set_subscription_count("_bar_refs", key, count - 1)
+            if count > 1:
+                continue
+            subscribed = self._desired_bars.pop(key, None)
             quote = self._quote
             if quote is not None and subscribed is not None:
-                await self._quote_call(
-                    partial(quote.unsubscribe_candlesticks, symbol, period)
-                )
+                await self._quote_call(partial(quote.unsubscribe_candlesticks, symbol, period))
 
     async def _request_quotes(self, request: Any) -> None:
         for instrument_id_value in _command_values(request, "instrument_ids", "instrument_id"):
@@ -1312,13 +1379,30 @@ class LongbridgeDataClient(DataClient):
             self._desired_book_deltas = set()
         for instrument_id_value in _command_values(command, "instrument_ids", "instrument_id"):
             symbol = symbol_from_instrument_id(instrument_id_value)
-            self._desired_book_depth[symbol] = getattr(command, "depth", None) or 10
+            count = self._subscription_count(
+                "_book_depth_refs", symbol, symbol in self._desired_book_depth
+            )
+            was_book_active = self._has_book_subscription(symbol)
+            self._set_subscription_count("_book_depth_refs", symbol, count + 1)
+            requested_depth = getattr(command, "depth", None) or 10
+            self._desired_book_depth[symbol] = max(
+                requested_depth, self._desired_book_depth.get(symbol, 0)
+            )
             self._desired_depth.add(symbol)
-            await self._subscribe_depth_only(symbol)
+            if not was_book_active:
+                await self._subscribe_depth_only(symbol)
 
     async def _unsubscribe_book_depth(self, command: Any) -> None:
         for instrument_id_value in _command_values(command, "instrument_ids", "instrument_id"):
             symbol = symbol_from_instrument_id(instrument_id_value)
+            count = self._subscription_count(
+                "_book_depth_refs", symbol, symbol in getattr(self, "_desired_book_depth", {})
+            )
+            if count <= 0:
+                continue
+            self._set_subscription_count("_book_depth_refs", symbol, count - 1)
+            if count > 1:
+                continue
             getattr(self, "_desired_book_depth", {}).pop(symbol, None)
             await self._maybe_unsubscribe_depth(symbol)
 
@@ -1328,13 +1412,27 @@ class LongbridgeDataClient(DataClient):
             self._desired_book_deltas = set()
         for instrument_id_value in _command_values(command, "instrument_ids", "instrument_id"):
             symbol = symbol_from_instrument_id(instrument_id_value)
+            count = self._subscription_count(
+                "_book_delta_refs", symbol, symbol in self._desired_book_deltas
+            )
+            was_book_active = self._has_book_subscription(symbol)
+            self._set_subscription_count("_book_delta_refs", symbol, count + 1)
             self._desired_book_deltas.add(symbol)
             self._desired_depth.add(symbol)
-            await self._subscribe_depth_only(symbol)
+            if not was_book_active:
+                await self._subscribe_depth_only(symbol)
 
     async def _unsubscribe_book_deltas(self, command: Any) -> None:
         for instrument_id_value in _command_values(command, "instrument_ids", "instrument_id"):
             symbol = symbol_from_instrument_id(instrument_id_value)
+            count = self._subscription_count(
+                "_book_delta_refs", symbol, symbol in getattr(self, "_desired_book_deltas", set())
+            )
+            if count <= 0:
+                continue
+            self._set_subscription_count("_book_delta_refs", symbol, count - 1)
+            if count > 1:
+                continue
             getattr(self, "_desired_book_deltas", set()).discard(symbol)
             await self._maybe_unsubscribe_depth(symbol)
 
@@ -1348,8 +1446,8 @@ class LongbridgeDataClient(DataClient):
         await self._quote_call(lambda: quote.subscribe([symbol], [SubType.Depth]))
 
     async def _maybe_unsubscribe_depth(self, symbol: str) -> None:
-        if symbol in self._desired_quotes or symbol in getattr(self, "_desired_book_depth", {}) \
-                or symbol in getattr(self, "_desired_book_deltas", set()):
+        if self._has_depth_subscription(symbol):
+            self._desired_depth.add(symbol)
             return
         self._desired_depth.discard(symbol)
         quote = self._quote
