@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 
 
 def _command_values(command: Any, plural: str, singular: str) -> tuple[Any, ...]:
-    """Return rc8 batch fields while retaining compatibility with rc7 test doubles."""
+    """Return NT batch fields while retaining compatibility with older test doubles."""
     values = getattr(command, plural, None)
     if values is not None:
         return tuple(values)
@@ -68,7 +68,7 @@ def _command_values(command: Any, plural: str, singular: str) -> tuple[Any, ...]
 
 
 class _RequestView:
-    """Expose one member of an rc8 batch request to a single-item request path."""
+    """Expose one member of a batch request to a single-item request path."""
 
     def __init__(self, request: Any, **values: Any) -> None:
         self._request = request
@@ -1098,6 +1098,8 @@ class LongbridgeDataClient(DataClient):
         if quote is None:
             return
         symbol = symbol_from_instrument_id(request.bar_type.instrument_id)
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise ValueError("Longbridge historical bars require one concrete symbol")
         from longbridge.openapi import AdjustType, TradeSessions
 
         from .evidence import HistoryEvidence
@@ -1129,6 +1131,7 @@ class LongbridgeDataClient(DataClient):
                     call=self._quote_call,
                     evidence=evidence.capture if evidence else None,
                     error_evidence=evidence.capture_error if evidence else None,
+                    request_evidence=evidence.capture_request if evidence else None,
                     trade_sessions=trade_sessions,
                 )
                 if request.limit:
@@ -1169,7 +1172,7 @@ class LongbridgeDataClient(DataClient):
                     data,
                     getattr(request, "request_id", UUID4()),
                     self.clock.timestamp_ns(),
-                    # The adapter has already filtered by ts_event. rc8's
+                    # The adapter has already filtered by ts_event. NT's
                     # response bounds trim by ts_init and would drop fetched
                     # history whose real receipt time is later than the range.
                     None,

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.10 — 2026-11-11
+
+### NautilusTrader rc9 compatibility
+
+- Bind the connector to `nautilus_trader==2.0.0rc9`.
+- Preserve rc8 batch request/subscription behavior on rc9 and validate native Catalog replay against rc9.
+- Retain request-level historical evidence and concrete single-symbol validation for Longbridge history calls.
+
+### Validation
+
+- Full connector pytest, Ruff and mypy pass locally on Python 3.14 with NautilusTrader 2.0.0rc9 and Longbridge 5.2.2.
+
 ## 0.1.9 — 2026-10-30
 
 ### NautilusTrader rc8 compatibility

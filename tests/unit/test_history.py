@@ -81,6 +81,11 @@ async def test_native_request_records_raw_response_before_validation(tmp_path, i
     directory = tmp_path / str(request_id)
     manifest = json.loads((directory / "manifest.json").read_text())
     assert manifest["status"] == ("FAILED" if invalid else "COMPLETE")
+    assert len(manifest["submitted_requests"]) == 1
+    submitted = manifest["submitted_requests"][0]
+    assert submitted["symbol"] == "SPY.US"
+    assert submitted["start"] == "2024-01-02" and submitted["end"] == "2024-01-02"
+    assert len(submitted["request_sha256"]) == 64
     raw = directory / manifest["requests"][0]["path"]
     assert hashlib.sha256(raw.read_bytes()).hexdigest() == manifest["requests"][0]["sha256"]
     assert json.loads(raw.read_text())["candles"][0]["high"] == ("98" if invalid else "102")
@@ -120,6 +125,7 @@ async def test_history_calendar_bounds_use_market_timezone_and_exact_last_nanose
 @pytest.mark.asyncio
 async def test_history_paginates_dates_and_filters_requested_bounds():
     calls = []
+    requests = []
 
     class Quote:
         async def history_candlesticks_by_date(self, symbol, period, adjustment, **kwargs):
@@ -144,10 +150,31 @@ async def test_history_paginates_dates_and_filters_requested_bounds():
         timestamp_ns(first),
         timestamp_ns(last),
         delay=0,
+        request_evidence=lambda first, last: requests.append((first, last)),
     )
     assert len(calls) == 6 and len(rows) == 6
+    assert requests == calls
     assert all((end - start).days < 730 for start, end in calls)
     assert calls[-1][1] == date(2026, 10, 23)
+
+
+@pytest.mark.asyncio
+async def test_history_records_date_request_error():
+    class Quote:
+        async def history_candlesticks_by_date(self, *args, **kwargs):
+            error = RuntimeError("code=301607 symbol count out of limit")
+            error.code = 301607
+            raise error
+
+    errors = []
+    with pytest.raises(RuntimeError, match="301607"):
+        await history_candles(
+            Quote(), "REGN.US", Period.Day, AdjustType.NoAdjust,
+            timestamp_ns(datetime(2024, 1, 2, tzinfo=NY)),
+            timestamp_ns(datetime(2024, 1, 2, tzinfo=NY)),
+            delay=0, error_evidence=lambda *item: errors.append(item),
+        )
+    assert errors == [(date(2024, 1, 2), 1, 301607, "RuntimeError")]
 
 
 @pytest.mark.asyncio

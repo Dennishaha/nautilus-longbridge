@@ -38,11 +38,14 @@ async def history_candles(
     call: Callable[..., Awaitable[Any]] | None = None,
     evidence: Callable[..., None] | None = None,
     error_evidence: Callable[..., None] | None = None,
+    request_evidence: Callable[..., None] | None = None,
     delay: float = 0.6,
     trade_sessions: str = "Intraday",
 ) -> list[Any]:
     from longbridge.openapi import TradeSessions
 
+    if not isinstance(symbol, str) or not symbol.strip():
+        raise ValueError("historical history requires exactly one non-empty symbol")
     if start_ns > end_ns:
         raise ValueError("historical range start exceeds end")
     if trade_sessions not in {"Intraday", "All"}:
@@ -60,7 +63,8 @@ async def history_candles(
         # Page backwards with an explicit anchor instead of truncating a day.
         return await _all_minute_history(
             quote, symbol, period, adjustment, start_ns, end_ns,
-            call=call, evidence=evidence, error_evidence=error_evidence, delay=delay,
+            call=call, evidence=evidence, error_evidence=error_evidence,
+            request_evidence=request_evidence, delay=delay,
         )
     rows, seen = [], set()
     cursor = first
@@ -77,9 +81,20 @@ async def history_candles(
                 trade_sessions=getattr(TradeSessions, trade_sessions),
             )
 
-        values = (
-            await call(operation) if call is not None else await asyncio.wait_for(operation(), 30)
-        )
+        if request_evidence is not None:
+            request_evidence(cursor, chunk_end)
+        try:
+            values = (
+                await call(operation) if call is not None else await asyncio.wait_for(operation(), 30)
+            )
+        except Exception as exc:
+            if error_evidence is not None:
+                match = re.search(r"\bcode=(\d+)\b", str(exc))
+                code = getattr(exc, "code", None)
+                if not isinstance(code, int):
+                    code = int(match.group(1)) if match else None
+                error_evidence(cursor, 1, code, type(exc).__name__)
+            raise
         if evidence is not None:
             evidence(cursor, chunk_end, values)
         if len(values) >= 1000:
@@ -119,6 +134,7 @@ async def _all_minute_history(
     *, call: Callable[..., Awaitable[Any]] | None,
     evidence: Callable[..., None] | None, delay: float,
     error_evidence: Callable[..., None] | None = None,
+    request_evidence: Callable[..., None] | None = None,
 ) -> list[Any]:
     from longbridge.openapi import TradeSessions
 
@@ -135,6 +151,11 @@ async def _all_minute_history(
             )
 
         for attempt in range(3):
+            if request_evidence is not None:
+                request_evidence(
+                    datetime.fromtimestamp(start_ns // 1_000_000_000, zone).date(),
+                    anchor.date(),
+                )
             try:
                 values = await call(operation) if call is not None else await asyncio.wait_for(operation(), 30)
                 break

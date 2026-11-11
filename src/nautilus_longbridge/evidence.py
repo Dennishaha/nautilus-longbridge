@@ -42,6 +42,24 @@ class HistoryEvidence:
         temporary.replace(path)
         return path
 
+    def capture_request(self, first: date, last: date) -> None:
+        requested_at = datetime.now(UTC)
+        request = {
+            "symbol": self.manifest["symbol"],
+            "period": self.manifest["period"],
+            "adjustment": self.manifest["adjustment"],
+            "trade_sessions": self.manifest["trade_sessions"],
+            "start": str(first),
+            "end": str(last),
+            "requested_at": requested_at.isoformat(),
+        }
+        canonical = json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
+        self.manifest.setdefault("submitted_requests", []).append({
+            **request,
+            "request_sha256": hashlib.sha256(canonical).hexdigest(),
+        })
+        self._write("manifest.json", self.manifest)
+
     def capture(self, first: date, last: date, values: list[Any]) -> None:
         received = datetime.now(UTC)
         zone = market_timezone(self.manifest["symbol"])
