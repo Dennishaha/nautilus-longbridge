@@ -28,6 +28,7 @@ def test_config_serialization_contains_no_credentials(monkeypatch: pytest.Monkey
     secret = "secret-value-that-must-never-appear"
     monkeypatch.setenv("LONGBRIDGE_APP_SECRET", secret)
     config = LongbridgeDataClientConfig()
+    assert config.completed_bars_only is True
     serialized = " ".join(
         [repr(config), str(config), json.dumps(config.dict()), config.json().decode()]
     )

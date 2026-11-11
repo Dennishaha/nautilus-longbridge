@@ -48,10 +48,12 @@ class LongbridgeExecutionClientFactory(ExecutionClientFactory):
             raise TypeError(
                 "LongbridgeExecutionClientFactory requires LongbridgeExecutionClientConfig"
             )
+        provider = LongbridgeInstrumentProvider(config.instrument_provider)
         return LongbridgeExecutionClient(
             name=name,
             config=config,
             cache=cache,
             clock=clock,
             trader_id=trader_id,
+            instrument_provider=provider,
         )

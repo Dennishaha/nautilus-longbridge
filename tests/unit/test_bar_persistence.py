@@ -59,6 +59,7 @@ async def test_unknown_sdk_period_is_never_persisted_as_another_period():
 @pytest.mark.asyncio
 async def test_final_update_survives_identical_unconfirmed_and_high_low_changes():
     client = _client()
+    client._lb_config.completed_bars_only = False
     output = []
     client._handle_data = output.append
     await client._publish_bar("700.HK", candle(confirmed=False))

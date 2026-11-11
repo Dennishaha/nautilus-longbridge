@@ -149,7 +149,7 @@ class LongbridgeDataClientConfig(_SafeConfigMixin, DataClientConfig):
         queue_size: int | None = None,
         price_precision: int = 4,
         price_increment: str = "0.0001",
-        completed_bars_only: bool = False,
+        completed_bars_only: bool = True,
         max_depth_age_secs: float = 2.0,
         historical_adjustment: str = "NoAdjust",
         historical_trade_sessions: str = "Intraday",
@@ -159,7 +159,8 @@ class LongbridgeDataClientConfig(_SafeConfigMixin, DataClientConfig):
         reference_account_enabled: bool = False,
         **kwargs: Any,
     ) -> None:
-        super().__init__(**kwargs)
+        # rc9 config fields are consumed by the inherited __new__; object.__init__
+        # cannot accept those keyword arguments on Python subclasses.
         resolved_region = (
             region if region is not None else (_env_text("LONGBRIDGE_REGION", "hk") or "hk")
         )
@@ -264,7 +265,8 @@ class LongbridgeExecutionClientConfig(_SafeConfigMixin, ExecutionClientConfig):
         queue_size: int | None = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(**kwargs)
+        # rc9 config fields are consumed by the inherited __new__; object.__init__
+        # cannot accept those keyword arguments on Python subclasses.
         if account_id is None:
             account_id = _env_text("LONGBRIDGE_ACCOUNT_ID")
         if account_id is None:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+
+import pytest
 
 from nautilus_longbridge.mapping import aggressor_side, price, timestamp_ns
 from nautilus_longbridge.rate_limit import SlidingWindowRateLimiter
@@ -13,9 +15,22 @@ def test_timestamp_is_utc_nanoseconds() -> None:
     assert timestamp_ns(value, 0) == 1_767_225_600_000_000_000
 
 
-def test_decimal_price_preserves_requested_precision() -> None:
-    converted = price(Decimal("12.34567"), 4)
-    assert converted.as_decimal() == Decimal("12.3457")
+def test_timestamp_conversion_does_not_use_float_rounding() -> None:
+    value = datetime(2026, 1, 2, 3, 4, 5, 123, tzinfo=UTC)
+    expected = (value - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(microseconds=1) * 1000
+    assert timestamp_ns(value, 0) == expected
+
+
+def test_decimal_price_rejects_unrepresentable_source_value() -> None:
+    with pytest.raises(ValueError, match="unrepresentable"):
+        price(Decimal("12.34567"), 4)
+    converted = price(Decimal("12.3456"), 4)
+    assert converted.as_decimal() == Decimal("12.3456")
+
+
+def test_nonfinite_provider_values_are_rejected() -> None:
+    with pytest.raises(ValueError, match="unrepresentable"):
+        price("NaN", 4)
 
 
 def test_aggressor_mapping() -> None:

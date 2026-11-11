@@ -43,6 +43,7 @@ def _client() -> LongbridgeDataClient:
 @pytest.mark.asyncio
 async def test_depth_and_quote_are_mapped_without_fabricating_bbo() -> None:
     client = _client()
+    client._desired_quotes = {"700.HK"}
     output: list[object] = []
     client._handle_data = output.append
     depth = SimpleNamespace(

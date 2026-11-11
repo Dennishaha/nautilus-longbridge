@@ -208,11 +208,17 @@ class LongbridgeDataClient(DataClient):
             self._accepting_events = True
             self._quote = self._context_factory.quote(self._lb_config.settings, loop)
             self._configure_quote_context(self._quote)
+            if isinstance(self.instrument_provider, LongbridgeInstrumentProvider):
+                await self.instrument_provider.initialize()
             self._consumer = self.create_task(self._consume(), "market-data-consumer")
             self._health_task = self.create_task(self._health_loop(), "market-data-health")
             await self._restore_subscriptions()
             self._connection_state = ConnectionState.CONNECTED
         except BaseException:
+            try:
+                await self._disconnect()
+            except BaseException:
+                logger.exception("failed to clean up Longbridge quote connection")
             self._connection_state = ConnectionState.FAILED
             raise
 
@@ -500,6 +506,15 @@ class LongbridgeDataClient(DataClient):
                     await self._publish_trades(symbol, event)
                 elif kind == "bar":
                     await self._publish_bar(symbol, event)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Longbridge market-data event dropped (%s, %s): %s",
+                    kind,
+                    symbol,
+                    type(exc).__name__,
+                )
             finally:
                 self._queue.task_done()
 
@@ -531,6 +546,8 @@ class LongbridgeDataClient(DataClient):
         ).hexdigest()
 
     async def _publish_quote(self, symbol: str, event: Any) -> None:
+        if symbol not in getattr(self, "_desired_quotes", set()):
+            return
         self._last_quotes[symbol] = event
         depth = self._last_depth.get(symbol)
         instrument_id = await self._ensure_instrument(symbol)
@@ -604,7 +621,7 @@ class LongbridgeDataClient(DataClient):
             self._handle_data(depth)
         if publish_deltas:
             self._handle_data(deltas)
-        if symbol in getattr(self, "_desired_quotes", set()) or symbol in self._last_quotes:
+        if symbol in getattr(self, "_desired_quotes", set()):
             tick = self._make_quote_tick(
                 instrument_id, symbol, self._last_quotes.get(symbol), event
             )
@@ -902,6 +919,9 @@ class LongbridgeDataClient(DataClient):
         for instrument_id_value in _command_values(command, "instrument_ids", "instrument_id"):
             symbol = symbol_from_instrument_id(instrument_id_value)
             self._desired_quotes.discard(symbol)
+            self._last_quotes.pop(symbol, None)
+            if hasattr(self, "_depth_received_ns"):
+                self._depth_received_ns.pop(symbol, None)
             if (
                 symbol not in getattr(self, "_desired_book_depth", {})
                 and symbol not in getattr(self, "_desired_book_deltas", set())

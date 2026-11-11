@@ -33,6 +33,24 @@ def depth():
 
 
 @pytest.mark.asyncio
+async def test_depth_does_not_publish_quote_after_quote_unsubscribe():
+    client = data_client()
+    client.clock = Clock()
+    client._desired_quotes = {"700.HK"}
+    output = []
+    client._handle_data = output.append
+    await client._publish_depth("700.HK", depth())
+    assert any(isinstance(value, QuoteTick) for value in output)
+
+    client._desired_quotes.clear()
+    client._last_quotes.pop("700.HK", None)
+    client._depth_received_ns.pop("700.HK", None)
+    output.clear()
+    await client._publish_depth("700.HK", depth())
+    assert not any(isinstance(value, QuoteTick) for value in output)
+
+
+@pytest.mark.asyncio
 async def test_depth_drives_quotes_and_last_trade_does_not_refresh_stale_bbo():
     client = data_client()
     client.clock = Clock()

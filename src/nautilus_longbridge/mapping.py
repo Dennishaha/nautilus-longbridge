@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 from nautilus_trader.model import AggressorSide, Price, Quantity
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def timestamp_ns(value: datetime | None, fallback: int) -> int:
@@ -13,20 +15,23 @@ def timestamp_ns(value: datetime | None, fallback: int) -> int:
     # SDK PyOffsetDateTimeWrapper uses datetime.fromtimestamp(..., None),
     # which returns OS-local naive time. astimezone uses that local timezone
     # for naive values and preserves the instant for aware values.
+    # Use datetime arithmetic instead of float timestamp conversion: the latter
+    # loses sub-microsecond alignment around current epoch values.
     # https://github.com/longbridge/openapi/blob/main/python/src/time.rs
-    return int(value.astimezone(UTC).timestamp() * 1_000_000_000)
+    return (value.astimezone(UTC) - _EPOCH) // timedelta(microseconds=1) * 1000
 
 
 def as_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
     if value is None:
         return default
-    if isinstance(value, Decimal):
-        return value
-    return Decimal(str(value))
+    return value if isinstance(value, Decimal) else Decimal(str(value))
 
 
 def price(value: Any, precision: int) -> Price:
-    return Price.from_decimal_dp(as_decimal(value), precision)
+    result = as_decimal(value)
+    if not result.is_finite() or result <= 0 or result != result.quantize(Decimal(1).scaleb(-precision)):
+        raise ValueError("nonpositive or unrepresentable price; refusing to round")
+    return Price.from_decimal_dp(result, precision)
 
 
 def quantity(value: Any, precision: int | None = None) -> Quantity:

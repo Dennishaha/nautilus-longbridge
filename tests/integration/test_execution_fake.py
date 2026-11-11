@@ -12,6 +12,7 @@ from nautilus_trader.model import (
     MarketOrder,
     OrderSide,
     OrderStatus,
+    Price,
     Quantity,
     StrategyId,
     TimeInForce,
@@ -198,6 +199,29 @@ async def test_hk_order_quantity_must_match_board_lot(
 
 
 @pytest.mark.asyncio
+async def test_modify_and_cancel_accept_native_rc9_commands() -> None:
+    context = FakeTradeContext()
+    client = _client(context)
+    order = _order()
+    client._pending_orders["O-1"] = order
+    client._venue_by_client["O-1"] = "123"
+    client._last_status["O-1"] = OrderStatus.ACCEPTED
+    client.generate_order_updated = lambda *args: None
+    client.generate_order_canceled = lambda *args: None
+
+    await client._modify_order(
+        SimpleNamespace(
+            client_order_id=order.client_order_id,
+            quantity=Quantity.from_int(100),
+            price=Price.from_str("10.20"),
+        )
+    )
+    await client._cancel_order(SimpleNamespace(client_order_id=order.client_order_id))
+
+    assert context.replaced and context.canceled == ["123"]
+
+
+@pytest.mark.asyncio
 async def test_cancel_waits_for_terminal_confirmation() -> None:
     context = FakeTradeContext()
     context.orders = [
@@ -221,7 +245,7 @@ async def test_cancel_waits_for_terminal_confirmation() -> None:
     canceled: list[object] = []
     client.generate_order_canceled = lambda *args: canceled.append(args)
 
-    await client._cancel_order(SimpleNamespace(order=order))
+    await client._cancel_order(SimpleNamespace(client_order_id=order.client_order_id))
 
     assert context.canceled == ["123"]
     assert len(canceled) == 1

@@ -249,12 +249,17 @@ class LongbridgeExecutionClient(ExecutionClient):
             self._quote = self._context_factory.quote(self._lb_config.settings, loop)
             if isinstance(self.instrument_provider, LongbridgeInstrumentProvider):
                 self.instrument_provider.set_quote_context(self._quote)
+                await self.instrument_provider.initialize()
             trade.set_on_order_changed(self._on_order_changed)
             self._consumer = self.create_task(self._consume(), "trade-event-consumer")
             self._health_task = self.create_task(self._health_loop(), "trade-health")
             await self._trade_call(lambda: trade.subscribe([_sdk_class("TopicType").Private]))
             self._connection_state = ConnectionState.CONNECTED
         except BaseException:
+            try:
+                await self._disconnect()
+            except BaseException:
+                logger.exception("failed to clean up Longbridge trade connection")
             self._connection_state = ConnectionState.FAILED
             logger.exception("failed to subscribe to Longbridge private order events")
             raise
@@ -910,38 +915,54 @@ class LongbridgeExecutionClient(ExecutionClient):
                 return True
         return False
 
+    def _command_order(self, command: Any) -> Any:
+        order = getattr(command, "order", None)
+        if order is not None:
+            return order
+        client_order_id = getattr(command, "client_order_id", None)
+        if client_order_id is None:
+            raise ConfigurationError("order command lacks a client order ID")
+        order = self._pending_orders.get(str(client_order_id))
+        cache = getattr(self, "cache", None)
+        if order is None and cache is not None:
+            order = cache.order(client_order_id)
+        if order is None:
+            raise ConfigurationError(f"unknown client order {client_order_id}")
+        return order
+
     async def _modify_order(self, command: Any) -> None:
-        order = command.order
+        order = self._command_order(command)
         venue_id = self._venue_by_client.get(str(order.client_order_id))
         if self._lb_config.account_mode == "MARGIN":
-            self.generate_order_modify_rejected(
-                order, VenueOrderId(venue_id) if venue_id else None,
+            self.generate_order_modify_denied(
+                order,
                 "paper margin amendments require cancel and a newly checked order",
                 self.clock.timestamp_ns(),
             )
             return
         if not venue_id or self._trade is None:
-            self.generate_order_modify_rejected(
+            self.generate_order_modify_denied(
                 order,
-                VenueOrderId(venue_id) if venue_id else None,
                 "unknown venue order",
                 self.clock.timestamp_ns(),
             )
             return
         trade = self._trade
+        quantity_value = command.quantity or order.quantity
+        price_value = command.price if command.price is not None else getattr(order, "price", None)
         try:
             await self._trade_call(
                 lambda: trade.replace_order(
                     order_id=venue_id,
-                    quantity=command.quantity.as_decimal(),
-                    price=command.price.as_decimal() if command.price is not None else None,
+                    quantity=quantity_value.as_decimal(),
+                    price=price_value.as_decimal() if price_value is not None else None,
                 )
             )
             self.generate_order_updated(
                 order,
                 VenueOrderId(venue_id),
-                command.quantity,
-                command.price,
+                quantity_value,
+                price_value,
                 None,
                 None,
                 self.clock.timestamp_ns(),
@@ -987,7 +1008,7 @@ class LongbridgeExecutionClient(ExecutionClient):
             )
 
     async def _cancel_order(self, command: Any) -> None:
-        order = command.order
+        order = self._command_order(command)
         key = str(order.client_order_id)
         if (
             self._lb_config.account_mode == "MARGIN"
@@ -1000,9 +1021,8 @@ class LongbridgeExecutionClient(ExecutionClient):
             return
         venue_id = self._venue_by_client.get(str(order.client_order_id))
         if not venue_id or self._trade is None:
-            self.generate_order_cancel_rejected(
+            self.generate_order_cancel_denied(
                 order,
-                VenueOrderId(venue_id) if venue_id else None,
                 "unknown venue order",
                 self.clock.timestamp_ns(),
             )
